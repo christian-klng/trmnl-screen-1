@@ -109,11 +109,11 @@ def test_pairing_lock_survives_a_restart(tmp_path):
 def test_prefix_moves_every_route(tmp_path):
     with make_client(tmp_path, url_prefix="/s/geheim") as client:
         assert client.get("/api/setup", headers={"ID": MAC}).status_code == 404
-        assert client.get("/healthz").status_code == 404
+        assert client.get("/status").status_code == 404
 
         response = client.get("/s/geheim/api/setup", headers={"ID": MAC})
         assert response.status_code == 200
-        assert client.get("/s/geheim/healthz").status_code == 200
+        assert client.get("/s/geheim/status").status_code == 200
 
 
 def test_prefix_is_included_in_the_image_url(tmp_path):
@@ -132,7 +132,7 @@ def test_prefix_is_normalised(tmp_path):
     """A prefix pasted with or without slashes must behave the same."""
     for raw in ("s/geheim", "/s/geheim", "/s/geheim/"):
         with make_client(tmp_path / raw.replace("/", "_"), url_prefix=raw) as client:
-            assert client.get("/s/geheim/healthz").status_code == 200
+            assert client.get("/s/geheim/status").status_code == 200
 
 
 # --- display -------------------------------------------------------------
@@ -252,12 +252,63 @@ def test_log_endpoint_survives_a_broken_body(client):
     assert response.status_code == 204
 
 
-def test_healthz_reports_state(client):
+def test_status_reports_state(client):
     client.get("/api/setup", headers={"ID": MAC})
-    body = client.get("/healthz").json()
+    body = client.get("/status").json()
     assert body["ok"] is True
     assert body["caldav_configured"] is False
     assert len(body["devices"]) == 1
+
+
+# --- the platform healthcheck ---------------------------------------------
+#
+# Regression: /healthz used to live on the prefixed router, so setting
+# URL_PREFIX moved it and Railway's healthcheck got a 404 on every attempt.
+
+
+def test_healthz_stays_at_the_root_without_a_prefix(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_healthz_stays_at_the_root_with_a_prefix(tmp_path):
+    with make_client(tmp_path, url_prefix="/s/geheim") as client:
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+
+def test_healthz_leaks_nothing(tmp_path):
+    """It is reachable without the secret prefix, so it must stay empty."""
+    with make_client(tmp_path, url_prefix="/s/geheim") as client:
+        client.get("/s/geheim/api/setup", headers={"ID": MAC})
+        body = client.get("/healthz").json()
+        assert set(body) == {"ok"}
+
+
+def test_detailed_status_stays_behind_the_prefix(tmp_path):
+    with make_client(tmp_path, url_prefix="/s/geheim") as client:
+        assert client.get("/status").status_code == 404
+        assert client.get("/s/geheim/status").status_code == 200
+
+
+def test_railway_healthcheck_path_matches_a_real_route(tmp_path):
+    """railway.toml and the code have to agree — they did not, and the deploy
+    failed on every healthcheck attempt."""
+    import re
+    from pathlib import Path
+
+    config = (Path(__file__).resolve().parent.parent / "railway.toml").read_text()
+    match = re.search(r'healthcheckPath\s*=\s*"([^"]+)"', config)
+    assert match, "railway.toml must declare a healthcheckPath"
+    path = match.group(1)
+
+    # It has to answer both with and without a prefix configured.
+    with make_client(tmp_path / "plain") as client:
+        assert client.get(path).status_code == 200
+    with make_client(tmp_path / "prefixed", url_prefix="/s/geheim") as client:
+        assert client.get(path).status_code == 200
 
 
 def test_image_token_survives_a_restart(tmp_path):

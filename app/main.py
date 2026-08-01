@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import secrets
 import string
 from contextlib import asynccontextmanager
@@ -87,13 +88,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task = asyncio.create_task(do_refresh())
         scheduler = build_scheduler(settings, do_refresh)
         scheduler.start()
+        # Logged in full because a deployment that misbehaves is almost always
+        # a variable that did not arrive the way it was meant to.
         log.info(
-            "Started. Fetch every %d min, device refresh %d s, quiet %02d:00-%02d:00",
+            "Started. data_dir=%s writable=%s url_prefix=%r caldav=%s ics=%s "
+            "allowed_macs=%d lock_first_pairing=%s fetch=%dmin refresh=%ds quiet=%02d-%02d tz=%s",
+            settings.data_dir,
+            os.access(settings.data_dir, os.W_OK),
+            settings.url_prefix or "(none)",
+            settings.caldav_configured,
+            [name for name, _ in settings.ics_sources] or "(none)",
+            len(settings.allowed_mac_set),
+            settings.lock_after_first_pairing,
             settings.fetch_interval_minutes,
             settings.display_refresh_seconds,
             settings.quiet_start_hour,
             settings.quiet_end_hour,
+            settings.timezone,
         )
+        log.info("Healthcheck on /healthz, detailed status on %s/status", settings.url_prefix)
         try:
             yield
         finally:
@@ -281,8 +294,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- operations -------------------------------------------------------
 
-    @router.get("/healthz")
-    async def healthz() -> JSONResponse:
+    @router.get("/status")
+    async def status() -> JSONResponse:
         devices = store.list_devices()
         return JSONResponse(
             {
@@ -306,6 +319,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ],
             }
         )
+
+    # The platform healthcheck has to reach a fixed path, so it cannot live
+    # behind URL_PREFIX. It deliberately says nothing beyond "the process is
+    # up" — the detailed view at <prefix>/status exposes calendar and device
+    # data and stays behind the secret.
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"ok": True})
 
     app.include_router(router, prefix=settings.url_prefix)
     return app

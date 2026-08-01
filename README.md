@@ -188,9 +188,10 @@ for the display.
 | `GET /image/<token>/<hash>.bmp` | The rendered screen |
 | `GET /preview/<token>.png` | The same screen as PNG, for a browser |
 | `POST /preview/<token>/refresh` | Force a calendar refresh |
-| `GET /healthz` | Render state, stale calendars, device telemetry |
+| `GET /healthz` | Liveness only, outside `URL_PREFIX` for the platform |
+| `GET /status` | Render state, stale calendars, device telemetry |
 
-`/image` and `/preview` carry the full contents of your calendar, so they are
+`/image`, `/preview` and `/status` carry the contents of your calendar, so they are
 guarded by an unguessable token generated on first start. Retrieve it from the
 `kv` table in `state.db`, or read it from the `image_url` that `/api/setup`
 returns.
