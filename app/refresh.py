@@ -11,6 +11,7 @@ from datetime import datetime
 from .caldav_source import fetch_calendars
 from .config import Settings
 from .events import Event, clip_and_dedupe, expand_calendar
+from .ics_source import fetch_ics_sources
 from .layout import build_layout
 from .render import render_message, render_week, to_bmp_bytes
 from .store import Store
@@ -33,11 +34,11 @@ async def refresh_screen(settings: Settings, store: Store, state: ScreenState) -
     now = datetime.now(tz)
     window = current_week(now, tz, settings.week_switch_weekday, settings.week_switch_hour)
 
-    if not settings.caldav_configured:
+    if not settings.any_source_configured:
         image = render_message(
             "Kein Kalender konfiguriert",
             [
-                "CALDAV_URL, CALDAV_USERNAME und CALDAV_PASSWORD setzen.",
+                "CALDAV_URL / CALDAV_USERNAME / CALDAV_PASSWORD oder ICS_URLS setzen.",
                 "Danach aktualisiert sich diese Anzeige automatisch.",
             ],
         )
@@ -45,26 +46,41 @@ async def refresh_screen(settings: Settings, store: Store, state: ScreenState) -
 
     documents: dict[str, list[str]] = {}
     failed: list[str] = []
+    errors: list[str] = []
 
-    try:
-        result = await asyncio.to_thread(
-            fetch_calendars,
-            settings.caldav_url,
-            settings.caldav_username,
-            settings.caldav_password,
-            window.start,
-            window.end,
-            settings.calendar_names or None,
-        )
-        documents = result.documents
-        failed = result.failed
-        state.last_error = None
-    except Exception as exc:  # noqa: BLE001 - the server being down must not blank the screen
-        log.exception("CalDAV fetch failed entirely")
-        state.last_error = str(exc)
-        # Nothing was fetched, so every calendar we know about falls back to
-        # its cached copy.
-        failed = settings.calendar_names or store.list_cached_calendars()
+    if settings.caldav_configured:
+        try:
+            result = await asyncio.to_thread(
+                fetch_calendars,
+                settings.caldav_url,
+                settings.caldav_username,
+                settings.caldav_password,
+                window.start,
+                window.end,
+                settings.calendar_names or None,
+            )
+            documents.update(result.documents)
+            failed.extend(result.failed)
+        except Exception as exc:  # noqa: BLE001 - the server being down must not blank the screen
+            log.exception("CalDAV fetch failed entirely")
+            errors.append(f"CalDAV: {exc}")
+            # Nothing was fetched, so every CalDAV calendar we know about falls
+            # back to its cached copy.
+            failed.extend(settings.calendar_names or store.list_cached_calendars())
+
+    if settings.ics_sources:
+        ics_result = await asyncio.to_thread(fetch_ics_sources, settings.ics_sources)
+        documents.update(ics_result.documents)
+        failed.extend(ics_result.failed)
+        if ics_result.failed:
+            errors.append(f"ICS: {', '.join(ics_result.failed)}")
+
+    state.last_error = " | ".join(errors) if errors else None
+
+    # A total CalDAV failure falls back to every cached calendar name, which now
+    # includes the ICS ones. Anything we did fetch is not failed, whatever the
+    # other source type did.
+    failed = [name for name in dict.fromkeys(failed) if name not in documents]
 
     for name, docs in documents.items():
         store.save_calendar(name, docs)

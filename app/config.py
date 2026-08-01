@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # Empty means "every calendar the account can see".
     caldav_calendars: str = ""
 
+    # --- Direct ICS/webcal URLs ---------------------------------------------
+    # Comma separated, either "Name=https://…" or a bare URL. Fetched directly
+    # on our own schedule, which bypasses a slow Nextcloud subscription job for
+    # calendars that live somewhere else (a Google secret iCal address, say).
+    ics_urls: str = ""
+
     # --- Display / device ---------------------------------------------------
     # Seconds the device sleeps between polls during the day.
     display_refresh_seconds: int = 900
@@ -56,14 +62,33 @@ class Settings(BaseSettings):
     railway_public_domain: str = Field(default="", alias="RAILWAY_PUBLIC_DOMAIN")
     # Guards /image and /preview. Generated and persisted on first start.
     image_token: str = ""
-    # If set, /api/setup requires it. Strongly recommended on a public host.
-    pairing_secret: str = ""
     log_level: str = "INFO"
+
+    # --- Pairing protection -------------------------------------------------
+    # The device can only be given a base URL, so it cannot send a custom
+    # header. These three are what actually works in that constraint.
+    #
+    # Mount the whole API under a secret path, e.g. "/s/9f3c…". The device URL
+    # then becomes https://host/s/9f3c… and the URL itself is the secret.
+    url_prefix: str = ""
+    # Comma separated MAC addresses allowed to pair. Empty means any.
+    allowed_macs: str = ""
+    # Once one device has paired, refuse to register further ones.
+    lock_after_first_pairing: bool = True
+    # Optional extra: an X-Pairing-Secret header or ?secret= query parameter.
+    # Only usable by clients that can send one; the TRMNL firmware cannot.
+    pairing_secret: str = ""
 
     @field_validator("caldav_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("url_prefix")
+    @classmethod
+    def _normalise_prefix(cls, v: str) -> str:
+        v = v.strip().strip("/")
+        return f"/{v}" if v else ""
 
     @property
     def tz(self) -> ZoneInfo:
@@ -76,6 +101,29 @@ class Settings(BaseSettings):
     @property
     def caldav_configured(self) -> bool:
         return bool(self.caldav_url and self.caldav_username and self.caldav_password)
+
+    @property
+    def ics_sources(self) -> list[tuple[str, str]]:
+        """(display name, url) pairs parsed from ICS_URLS."""
+        sources: list[tuple[str, str]] = []
+        for index, entry in enumerate(self.ics_urls.split(",")):
+            entry = entry.strip()
+            if not entry:
+                continue
+            name, separator, url = entry.partition("=")
+            if separator and not name.strip().lower().startswith(("http", "webcal")):
+                sources.append((name.strip(), url.strip()))
+            else:
+                sources.append((f"ICS {index + 1}", entry))
+        return sources
+
+    @property
+    def any_source_configured(self) -> bool:
+        return self.caldav_configured or bool(self.ics_sources)
+
+    @property
+    def allowed_mac_set(self) -> set[str]:
+        return {m.strip().upper() for m in self.allowed_macs.split(",") if m.strip()}
 
 
 @lru_cache

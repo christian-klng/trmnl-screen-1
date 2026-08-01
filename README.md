@@ -54,16 +54,38 @@ edge markers instead of widening it.
 copy is used and its name is marked in the header. A calendar server hiccup
 showing an empty week would be the worst possible failure.
 
+## Calendar sources
+
+Two kinds, and they can be combined:
+
+- **CalDAV** (`CALDAV_URL`, `CALDAV_USERNAME`, `CALDAV_PASSWORD`) — Nextcloud or
+  any CalDAV server, using an app password.
+- **Direct ICS/webcal URLs** (`ICS_URLS`) — fetched on our own schedule.
+
+The second exists to route around a slow intermediary. A Google calendar
+subscribed inside Nextcloud is only as fresh as Nextcloud's subscription job,
+which defaults to once a day and needs shell access to change. Pointing at
+Google's secret iCal address directly puts it back on the 9-minute cycle.
+`webcal://` URLs are rewritten to `https://` automatically.
+
+A response that is not iCalendar — a login or error page, say — is treated as a
+failure rather than as an empty calendar, so a broken URL cannot silently erase
+those events from the screen.
+
 ## Configuration
 
 All settings come from environment variables; see [`.env.example`](.env.example).
-The required ones are `CALDAV_URL`, `CALDAV_USERNAME`, `CALDAV_PASSWORD`.
+At least one of the CalDAV trio or `ICS_URLS` must be set.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `CALDAV_CALENDARS` | *(all)* | Comma-separated display names, up to 5 |
+| `ICS_URLS` | *(none)* | `Name=URL`, comma separated |
 | `DATA_DIR` | `/data` | Must be persistent (see below) |
-| `PAIRING_SECRET` | *(none)* | Required to pair a new device |
+| `URL_PREFIX` | *(none)* | Mount the API under a secret path |
+| `ALLOWED_MACS` | *(any)* | MAC allowlist for pairing |
+| `LOCK_AFTER_FIRST_PAIRING` | `true` | Refuse a second device |
+| `PAIRING_SECRET` | *(none)* | Header/query secret; the firmware cannot send one |
 | `DISPLAY_REFRESH_SECONDS` | `900` | Device sleep between polls |
 | `FETCH_INTERVAL_MINUTES` | `9` | Calendar refresh |
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `23` / `5` | Overnight sleep |
@@ -123,20 +145,38 @@ Tests:
    slept service can return 502 — which the display would see as a failed poll.
    The 9-minute fetch interval keeps a margin below that threshold, but the
    setting is the actual fix.
-4. Set the environment variables from `.env.example`, including a
-   `PAIRING_SECRET`.
-5. Generate a public domain. That URL is what the display gets in pairing mode.
+4. Set the environment variables from `.env.example`, including calendar
+   sources and a `URL_PREFIX`.
+5. Generate a public domain. That URL plus `URL_PREFIX` is what the display
+   gets in pairing mode.
 
 ## Pairing the display
 
-Put the device into pairing mode and give it the server URL. It calls
-`/api/setup` once, stores the returned `api_key`, and uses it for every later
-`/api/display` call.
+In the captive portal: *Advanced → Custom Server → Yes*, then the base URL with
+no trailing slash. The firmware appends `/api/...` itself. It calls `/api/setup`
+once, stores the returned `api_key`, and uses it for every later `/api/display`.
 
-With a `PAIRING_SECRET` set, the first call needs it as an `X-Pairing-Secret`
-header or a `?secret=` query parameter. If the firmware cannot send either,
-pair once with the secret unset and then set it — devices that already paired
-keep working.
+**The device accepts a URL and nothing else** — no custom headers, no extra
+fields. That shapes what pairing protection can look like, because `/api/setup`
+is otherwise open to anyone who finds the host:
+
+1. **`URL_PREFIX`** — mount everything under a secret path and hand the device
+   `https://your-app.up.railway.app/s/<long-random-string>`. The URL becomes the
+   credential. This is the only mechanism that keeps the endpoints from being
+   discoverable at all.
+2. **`ALLOWED_MACS`** — only listed MAC addresses may register. The MAC is not a
+   secret, but combined with 1 it is a solid second gate.
+3. **`LOCK_AFTER_FIRST_PAIRING`** (on by default) — after your device has
+   paired, no other can. Zero configuration, and enough on its own for a single
+   display, though it does mean a stranger who reaches `/api/setup` before you
+   do would take the slot. Pair first, then relax.
+
+An already-paired device may always re-run `/api/setup`, so a factory reset does
+not lock you out.
+
+`PAIRING_SECRET` is kept for clients that *can* send an `X-Pairing-Secret`
+header or `?secret=` parameter. The TRMNL firmware cannot, so do not rely on it
+for the display.
 
 ## Endpoints
 

@@ -15,7 +15,7 @@ import string
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
@@ -106,6 +106,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.screen = state
     app.state.image_token = token
 
+    # Every route is mounted under URL_PREFIX. With a secret prefix the device
+    # URL itself becomes the credential, which is the only shape of secret the
+    # firmware can carry — it accepts a base URL and nothing else.
+    router = APIRouter()
+
     def base_url(request: Request) -> str:
         if settings.public_base_url:
             return settings.public_base_url.rstrip("/")
@@ -118,27 +123,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def image_url(request: Request) -> tuple[str, str]:
         digest = store.current_digest() or "pending"
         filename = f"{digest}.bmp"
-        return f"{base_url(request)}/image/{token}/{filename}", filename
+        return f"{base_url(request)}{settings.url_prefix}/image/{token}/{filename}", filename
+
+    def reject_pairing(mac: str, request: Request) -> str | None:
+        """Why this MAC may not register as a new device, or None if it may.
+
+        The firmware can only be handed a base URL, so it cannot send a custom
+        header. That rules out a header secret as the primary defence and puts
+        the weight on URL_PREFIX, the MAC allowlist and the first-pairing lock.
+        """
+        allowed = settings.allowed_mac_set
+        if allowed and mac not in allowed:
+            return "MAC not in ALLOWED_MACS"
+
+        if settings.pairing_secret:
+            supplied = request.headers.get("x-pairing-secret") or request.query_params.get("secret")
+            if not secrets.compare_digest(supplied or "", settings.pairing_secret):
+                return "invalid pairing secret"
+
+        if settings.lock_after_first_pairing and store.list_devices():
+            return "a device is already paired (LOCK_AFTER_FIRST_PAIRING)"
+
+        return None
 
     # --- device endpoints -------------------------------------------------
 
-    @app.api_route("/api/setup", methods=["GET", "POST"])
+    @router.api_route("/api/setup", methods=["GET", "POST"])
     async def api_setup(request: Request) -> JSONResponse:
         mac = _normalise_mac(request.headers.get("id"))
         if not mac:
             raise HTTPException(status_code=400, detail="Missing ID header")
 
-        if settings.pairing_secret:
-            supplied = request.headers.get("x-pairing-secret") or request.query_params.get("secret")
-            device = store.get_device(mac)
-            # A known device may re-run setup after a factory reset without the
-            # secret; an unknown one may not pair without it.
-            if device is None and not secrets.compare_digest(supplied or "", settings.pairing_secret):
-                log.warning("Rejected pairing attempt from %s", mac)
-                raise HTTPException(status_code=403, detail="Invalid pairing secret")
-
         device = store.get_device(mac)
         if device is None:
+            # A device that already paired may always re-run setup, e.g. after
+            # a factory reset.
+            reason = reject_pairing(mac, request)
+            if reason:
+                log.warning("Rejected pairing attempt from %s: %s", mac, reason)
+                raise HTTPException(status_code=403, detail="Pairing refused")
             device = store.create_device(mac, secrets.token_urlsafe(24), _friendly_id())
             log.info("Paired new device %s as %s", mac, device["friendly_id"])
 
@@ -153,7 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
-    @app.api_route("/api/display", methods=["GET", "POST"])
+    @router.api_route("/api/display", methods=["GET", "POST"])
     async def api_display(
         request: Request,
         id: str | None = Header(default=None),
@@ -191,7 +214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
-    @app.post("/api/log")
+    @router.post("/api/log")
     async def api_log(request: Request) -> Response:
         mac = _normalise_mac(request.headers.get("id")) or "unknown"
         try:
@@ -213,7 +236,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- image delivery ---------------------------------------------------
 
-    @app.get("/image/{supplied_token}/{filename}")
+    @router.get("/image/{supplied_token}/{filename}")
     async def serve_image(supplied_token: str, filename: str) -> Response:
         if not secrets.compare_digest(supplied_token, token):
             raise HTTPException(status_code=404, detail="Not found")
@@ -234,7 +257,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.get("/preview/{supplied_token}.png")
+    @router.get("/preview/{supplied_token}.png")
     async def preview(supplied_token: str) -> Response:
         """Exactly what the device shows, as PNG for a browser."""
         if not secrets.compare_digest(supplied_token, token):
@@ -249,7 +272,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with Image.open(store.image_path(digest)) as image:
             return Response(content=to_png_bytes(image), media_type="image/png")
 
-    @app.post("/preview/{supplied_token}/refresh")
+    @router.post("/preview/{supplied_token}/refresh")
     async def force_refresh(supplied_token: str) -> JSONResponse:
         if not secrets.compare_digest(supplied_token, token):
             raise HTTPException(status_code=404, detail="Not found")
@@ -258,7 +281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- operations -------------------------------------------------------
 
-    @app.get("/healthz")
+    @router.get("/healthz")
     async def healthz() -> JSONResponse:
         devices = store.list_devices()
         return JSONResponse(
@@ -270,6 +293,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "stale_calendars": state.stale_calendars,
                 "last_error": state.last_error,
                 "caldav_configured": settings.caldav_configured,
+                "ics_sources": [name for name, _ in settings.ics_sources],
                 "devices": [
                     {
                         "friendly_id": d["friendly_id"],
@@ -283,4 +307,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
+    app.include_router(router, prefix=settings.url_prefix)
     return app

@@ -65,6 +65,76 @@ def test_pairing_secret_blocks_unknown_devices(tmp_path):
         assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
 
 
+# --- pairing protection that works with a URL-only device ------------------
+
+OTHER_MAC = "11:22:33:44:55:66"
+
+
+def test_first_pairing_lock_refuses_a_second_device(tmp_path):
+    """The default protection: one device pairs, no other can follow."""
+    with make_client(tmp_path) as client:
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
+        assert client.get("/api/setup", headers={"ID": OTHER_MAC}).status_code == 403
+        # The paired one keeps working.
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
+
+
+def test_first_pairing_lock_can_be_disabled(tmp_path):
+    with make_client(tmp_path, lock_after_first_pairing=False) as client:
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
+        assert client.get("/api/setup", headers={"ID": OTHER_MAC}).status_code == 200
+
+
+def test_mac_allowlist_rejects_everything_else(tmp_path):
+    with make_client(tmp_path, allowed_macs=MAC, lock_after_first_pairing=False) as client:
+        assert client.get("/api/setup", headers={"ID": OTHER_MAC}).status_code == 403
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
+
+
+def test_mac_allowlist_is_case_insensitive(tmp_path):
+    with make_client(tmp_path, allowed_macs=MAC.lower()) as client:
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 200
+
+
+def test_pairing_lock_survives_a_restart(tmp_path):
+    with make_client(tmp_path) as first:
+        first.get("/api/setup", headers={"ID": MAC})
+    with make_client(tmp_path) as second:
+        assert second.get("/api/setup", headers={"ID": OTHER_MAC}).status_code == 403
+
+
+# --- secret URL prefix -----------------------------------------------------
+
+
+def test_prefix_moves_every_route(tmp_path):
+    with make_client(tmp_path, url_prefix="/s/geheim") as client:
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 404
+        assert client.get("/healthz").status_code == 404
+
+        response = client.get("/s/geheim/api/setup", headers={"ID": MAC})
+        assert response.status_code == 200
+        assert client.get("/s/geheim/healthz").status_code == 200
+
+
+def test_prefix_is_included_in_the_image_url(tmp_path):
+    with make_client(tmp_path, url_prefix="/s/geheim") as client:
+        body = client.get("/s/geheim/api/setup", headers={"ID": MAC}).json()
+        assert body["image_url"].startswith("https://example.test/s/geheim/image/")
+
+        api_key = body["api_key"]
+        display = client.get(
+            "/s/geheim/api/display", headers={"ID": MAC, "Access-Token": api_key}
+        ).json()
+        assert "/s/geheim/image/" in display["image_url"]
+
+
+def test_prefix_is_normalised(tmp_path):
+    """A prefix pasted with or without slashes must behave the same."""
+    for raw in ("s/geheim", "/s/geheim", "/s/geheim/"):
+        with make_client(tmp_path / raw.replace("/", "_"), url_prefix=raw) as client:
+            assert client.get("/s/geheim/healthz").status_code == 200
+
+
 # --- display -------------------------------------------------------------
 
 
