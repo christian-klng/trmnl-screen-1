@@ -1,0 +1,28 @@
+[project]
+name = "trmnl-screen-1"
+version = "0.1.0"
+description = "BYOS server rendering an aggregated week calendar for a TRMNL e-ink display"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pillow>=10.4",
+    "caldav>=1.3",
+    "icalendar>=6.0",
+    "recurring-ical-events>=3.0",
+    "apscheduler>=3.10",
+    "pydantic-settings>=2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

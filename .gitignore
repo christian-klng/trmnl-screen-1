@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
+
+# Local runtime state (on Railway this lives on the mounted volume)
+data/
+*.db
+
+# Local render output (docs/preview.png is committed on purpose)
+/preview.png
+*.bmp
+
+.DS_Store
