@@ -48,7 +48,8 @@ the next line carries on.
 hours actually used that week, with a minimum span of 8 h so a quiet week is not
 stretched absurdly and a maximum of 15 h so one 04:00 flight cannot ruin the
 resolution of every other day. Events outside the window are shown as `↑n` / `↓n`
-edge markers instead of widening it.
+edge markers instead of widening it. A week with no events at all falls back to
+08:00–16:00.
 
 **Never a blank screen.** If a calendar cannot be fetched, its last known good
 copy is used and its name is marked in the header. A calendar server hiccup
