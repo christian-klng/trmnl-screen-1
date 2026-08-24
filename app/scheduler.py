@@ -7,7 +7,6 @@ from datetime import datetime, time, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Settings
 
@@ -39,12 +38,16 @@ def refresh_rate_for(now: datetime, settings: Settings) -> int:
 
 
 def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
-    """Periodic refresh, paused overnight.
+    """Refresh on fixed minutes of the hour, paused overnight.
 
-    The interval is deliberately under ten minutes: Railway treats a service as
-    idle after ten minutes without outbound traffic, and the first request to a
-    slept service can come back as a 502 that the display would see as a failed
-    poll.
+    Fixed minutes rather than an interval because the rendered image carries an
+    HH:MM stamp: on an interval it drifts across the hour, on fixed minutes it
+    always reads the same tidy values.
+
+    The gap between refreshes is now longer than the ten minutes after which
+    Railway's serverless mode considers a service idle — app sleeping has to
+    stay switched off for this service, or the device's poll can hit a cold
+    start and see a 502 as a failed poll.
     """
     scheduler = AsyncIOScheduler(timezone=settings.tz)
 
@@ -57,18 +60,19 @@ def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
 
     scheduler.add_job(
         periodic,
-        IntervalTrigger(minutes=settings.fetch_interval_minutes),
+        CronTrigger(minute=settings.fetch_at_minutes, timezone=settings.tz),
         id="periodic_refresh",
         max_instances=1,
         coalesce=True,
     )
 
     # One fetch shortly before the device wakes, so the first screen of the day
-    # is current rather than eight hours old.
+    # is current rather than eight hours old. On the half hour like every other
+    # refresh, so the stamp on that first screen reads like all the others.
     wake_prep_hour = (settings.quiet_end_hour - 1) % 24
     scheduler.add_job(
         refresh_callable,
-        CronTrigger(hour=wake_prep_hour, minute=50, timezone=settings.tz),
+        CronTrigger(hour=wake_prep_hour, minute=30, timezone=settings.tz),
         id="morning_refresh",
         max_instances=1,
         coalesce=True,

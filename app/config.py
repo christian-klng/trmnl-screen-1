@@ -39,10 +39,16 @@ class Settings(BaseSettings):
     quiet_end_hour: int = 5
 
     # --- Fetching -----------------------------------------------------------
-    # Deliberately below 10 minutes: Railway's serverless mode considers a
-    # service idle after 10 minutes without outbound traffic, and the first
-    # request to a slept service can return 502.
-    fetch_interval_minutes: int = 9
+    # Minutes of the hour at which calendars are refreshed, comma separated.
+    # Fixed minutes rather than an interval because the rendered image carries
+    # an HH:MM stamp: on an interval that stamp drifts, on fixed minutes it
+    # always reads a tidy value and the screen updates predictably.
+    #
+    # Note the trade-off against Railway's serverless mode, which considers a
+    # service idle after ten minutes without outbound traffic: with gaps longer
+    # than that, the device's poll may hit a cold start. Keep app sleeping
+    # switched off for this service, or narrow the gaps here.
+    fetch_at_minutes: str = "0,30"
 
     # --- Week window --------------------------------------------------------
     # 6 == Sunday. From this weekday and hour onward the next week is shown.
@@ -83,6 +89,22 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("fetch_at_minutes")
+    @classmethod
+    def _validate_minutes(cls, v: str) -> str:
+        """Reject a typo here rather than at scheduler start.
+
+        An invalid cron expression would otherwise take the whole app down on
+        boot, which is a lot of damage for a stray character in a variable.
+        """
+        minutes = [m.strip() for m in v.split(",") if m.strip()]
+        if not minutes:
+            raise ValueError("FETCH_AT_MINUTES must name at least one minute")
+        for minute in minutes:
+            if not minute.isdigit() or not 0 <= int(minute) <= 59:
+                raise ValueError(f"Not a minute of the hour: {minute!r}")
+        return ",".join(str(int(m)) for m in minutes)
 
     @field_validator("url_prefix")
     @classmethod

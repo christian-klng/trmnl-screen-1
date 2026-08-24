@@ -22,7 +22,7 @@ device wakes  ──▶  GET /api/display  ──▶  { image_url, filename, ref
 Meanwhile the server refreshes calendar data on its own schedule:
 
 ```
-every 9 min  ──▶  CalDAV fetch  ──▶  expand recurrences  ──▶  layout  ──▶  render
+:00 and :30  ──▶  CalDAV fetch  ──▶  expand recurrences  ──▶  layout  ──▶  render
 ```
 
 `filename` is the device's cache key, so it is set to a hash of the image
@@ -66,7 +66,7 @@ Two kinds, and they can be combined:
 The second exists to route around a slow intermediary. A Google calendar
 subscribed inside Nextcloud is only as fresh as Nextcloud's subscription job,
 which defaults to once a day and needs shell access to change. Pointing at
-Google's secret iCal address directly puts it back on the 9-minute cycle.
+Google's secret iCal address directly puts it back on our own half-hourly cycle.
 `webcal://` URLs are rewritten to `https://` automatically.
 
 A response that is not iCalendar — a login or error page, say — is treated as a
@@ -88,7 +88,7 @@ At least one of the CalDAV trio or `ICS_URLS` must be set.
 | `LOCK_AFTER_FIRST_PAIRING` | `true` | Refuse a second device |
 | `PAIRING_SECRET` | *(none)* | Header/query secret; the firmware cannot send one |
 | `DISPLAY_REFRESH_SECONDS` | `900` | Device sleep between polls |
-| `FETCH_INTERVAL_MINUTES` | `9` | Calendar refresh |
+| `FETCH_AT_MINUTES` | `0,30` | Minutes of the hour to refresh calendars on |
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `23` / `5` | Overnight sleep |
 | `WEEK_SWITCH_WEEKDAY` / `WEEK_SWITCH_HOUR` | `6` / `12` | Sunday noon flips to next week |
 | `GRID_MIN_HOURS` / `GRID_MAX_HOURS` | `8` / `15` | Adaptive window bounds |
@@ -108,9 +108,10 @@ php occ config:app:set dav calendarSubscriptionRefreshRate --value "PT15M"
 somebody has the web UI open, so subscribed calendars effectively never update.
 
 Be aware of the resulting chain for Google events: Google's ICS export cache →
-Nextcloud's refresh job → this server's 9-minute fetch → the device's 15-minute
-poll. Calendars living natively in Nextcloud are on the display within about
-25 minutes; Google events are slower, and by how much is up to Google's cache.
+Nextcloud's refresh job → this server's half-hourly fetch → the device's
+15-minute poll. Calendars living natively in Nextcloud are on the display
+within about 45 minutes; Google events are slower, and by how much is up to
+Google's cache.
 
 ## Running locally
 
@@ -144,8 +145,8 @@ Tests:
 3. **Turn Serverless off** for this service. Railway considers a service idle
    after ten minutes without *outbound* traffic, and the first request to a
    slept service can return 502 — which the display would see as a failed poll.
-   The 9-minute fetch interval keeps a margin below that threshold, but the
-   setting is the actual fix.
+   This is not optional: calendars are fetched on the half hour, so nothing
+   else keeps the service awake between polls.
 4. Set the environment variables from `.env.example`, including calendar
    sources and a `URL_PREFIX`.
 5. Generate a public domain. That URL plus `URL_PREFIX` is what the display
