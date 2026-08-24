@@ -58,6 +58,14 @@ class Store:
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(SCHEMA)
+            # Without auto_vacuum SQLite never returns freed pages to the
+            # filesystem, so the file only ever grows. Enabling it on an
+            # existing database requires one VACUUM, which also reclaims
+            # whatever has accumulated so far.
+            if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 1:
+                conn.execute("PRAGMA auto_vacuum = FULL")
+                conn.commit()
+                conn.execute("VACUUM")
 
     # --- devices ----------------------------------------------------------
 
@@ -113,12 +121,21 @@ class Store:
     # --- last known good calendar data ------------------------------------
 
     def save_calendar(self, name: str, documents: list[str]) -> None:
+        payload = json.dumps(documents)
         with self._lock, self._connect() as conn:
+            # A calendar export can be megabytes, and any UPDATE rewrites the
+            # whole row. Rewriting an unchanged blob every fetch makes the
+            # database file grow through fragmentation, so skip it entirely.
+            row = conn.execute(
+                "SELECT documents FROM calendar_cache WHERE name = ?", (name,)
+            ).fetchone()
+            if row and row["documents"] == payload:
+                return
             conn.execute(
                 "INSERT INTO calendar_cache (name, documents, fetched_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET documents = excluded.documents, "
                 "fetched_at = excluded.fetched_at",
-                (name, json.dumps(documents), _utcnow()),
+                (name, payload, _utcnow()),
             )
 
     def list_cached_calendars(self) -> list[str]:
