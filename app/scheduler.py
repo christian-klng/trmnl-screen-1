@@ -37,6 +37,38 @@ def refresh_rate_for(now: datetime, settings: Settings) -> int:
     return settings.display_refresh_seconds
 
 
+def full_refresh_due(
+    *,
+    changed: bool,
+    draws_since_full: int,
+    last_full_date: str | None,
+    today: str,
+    every: int,
+) -> bool:
+    """Whether this redraw should flash the panel black and white.
+
+    The firmware draws a 1-bit image with a partial, flicker-free update and
+    only wipes the panel properly when its own counter says so — a counter its
+    BMP branch resets on every draw, so for years of screens it would never
+    fire. Rather than depend on which branch the firmware takes, we ask for the
+    full refresh ourselves through ``maximum_compatibility``.
+
+    An unchanged filename is not a redraw: the device keeps its cached image
+    and leaves the panel alone, so a flag spent there would be spent on
+    nothing. Hence ``changed``.
+
+    The first redraw of each local day is always full. With the device asleep
+    through the quiet hours that is the screen someone walks up to in the
+    morning, and it makes the cadence self-correcting if the counter is ever
+    lost with the volume.
+    """
+    if not changed:
+        return False
+    if last_full_date != today:
+        return True
+    return draws_since_full + 1 >= every
+
+
 def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
     """Refresh on fixed minutes of the hour, paused overnight.
 

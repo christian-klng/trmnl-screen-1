@@ -161,7 +161,7 @@ def test_display_returns_the_firmware_contract(client):
     body = response.json()
 
     assert body["status"] == 0
-    assert body["filename"].endswith(".bmp")
+    assert body["filename"].endswith(".png")
     assert body["filename"] in body["image_url"]
     # 900 during the day, the remaining sleep during quiet hours.
     assert isinstance(body["refresh_rate"], int)
@@ -170,6 +170,8 @@ def test_display_returns_the_firmware_contract(client):
     assert body["reset_firmware"] is False
     assert body["special_function"] == "none"
     assert body["firmware_url"] is None
+    assert body["maximum_compatibility"] is True  # the first draw of the day
+    assert body["temperature_profile"] == "default"
 
 
 def test_display_records_telemetry(client, tmp_path):
@@ -200,28 +202,146 @@ def test_malformed_telemetry_does_not_break_the_poll(client):
     assert response.status_code == 200
 
 
+# --- full refresh cadence --------------------------------------------------
+#
+# The device draws a 1-bit image with a partial, flicker-free update. Without a
+# black/white wipe every so often the panel washes out over weeks, and the
+# firmware's own every-eighth-update wipe never fires for the images we serve.
+
+
+def poll(client, api_key, mac=MAC):
+    return client.get("/api/display", headers={"ID": mac, "Access-Token": api_key}).json()
+
+
+def redraw(client, digest):
+    """Pretend the week changed: a new digest is a new filename."""
+    client.app.state.store.save_image(digest, b"not really an image")
+
+
+def test_the_first_draw_of_the_day_is_a_full_refresh(client):
+    api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+    assert poll(client, api_key)["maximum_compatibility"] is True
+
+
+def test_an_unchanged_screen_never_asks_for_a_full_refresh(client):
+    """The device keeps its cached image and does not touch the panel, so a
+    full refresh asked for here would simply be thrown away."""
+    api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+    poll(client, api_key)  # consumes the daily full refresh
+
+    for _ in range(20):
+        assert poll(client, api_key)["maximum_compatibility"] is False
+
+    device = client.app.state.store.get_device(MAC)
+    assert device["draws_since_full"] == 0
+
+
+def test_every_eighth_redraw_is_a_full_refresh(client):
+    api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+    poll(client, api_key)  # consumes the daily full refresh
+
+    modes = []
+    for i in range(1, 25):
+        redraw(client, f"{i:016x}")
+        modes.append(poll(client, api_key)["maximum_compatibility"])
+
+    # Seven quiet partials, then the wipe, three times over.
+    assert modes == [False] * 7 + [True] + [False] * 7 + [True] + [False] * 7 + [True]
+
+
+def test_the_cadence_is_configurable(tmp_path):
+    with make_client(tmp_path, full_refresh_every=3) as client:
+        api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+        poll(client, api_key)
+
+        modes = []
+        for i in range(1, 7):
+            redraw(client, f"{i:016x}")
+            modes.append(poll(client, api_key)["maximum_compatibility"])
+        assert modes == [False, False, True, False, False, True]
+
+
+def test_every_redraw_can_be_forced_full(tmp_path):
+    """FULL_REFRESH_EVERY=1 is the setting for scrubbing an already washed-out
+    panel back to contrast over a day."""
+    with make_client(tmp_path, full_refresh_every=1) as client:
+        api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+        poll(client, api_key)
+        for i in range(1, 5):
+            redraw(client, f"{i:016x}")
+            assert poll(client, api_key)["maximum_compatibility"] is True
+
+
+def test_the_counter_survives_a_restart(tmp_path):
+    """It lives on the volume with everything else, so a redeploy in the middle
+    of the day must not restart the cadence."""
+    with make_client(tmp_path) as client:
+        api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+        poll(client, api_key)
+        for i in range(1, 8):
+            redraw(client, f"{i:016x}")
+            poll(client, api_key)
+
+    with make_client(tmp_path) as client:
+        redraw(client, "00000000000000ff")
+        assert poll(client, api_key)["maximum_compatibility"] is True
+
+
+def test_the_temperature_profile_is_sent_on_every_response(tmp_path):
+    """The firmware overwrites its stored profile from each response, so
+    leaving the field out would pin the device to the default forever."""
+    with make_client(tmp_path, temperature_profile="a") as client:
+        api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+        assert poll(client, api_key)["temperature_profile"] == "a"
+        assert poll(client, api_key)["temperature_profile"] == "a"
+
+
 # --- image delivery ------------------------------------------------------
 
 
 def test_image_requires_the_token(client):
     digest = client.app.state.store.current_digest()
-    assert client.get(f"/image/wrong-token/{digest}.bmp").status_code == 404
+    assert client.get(f"/image/wrong-token/{digest}.png").status_code == 404
 
 
-def test_image_is_served_as_bmp(client):
+def test_image_is_served_as_png(client):
     token = client.app.state.image_token
     digest = client.app.state.store.current_digest()
-    response = client.get(f"/image/{token}/{digest}.bmp")
+    response = client.get(f"/image/{token}/{digest}.png")
     assert response.status_code == 200
-    assert response.headers["content-type"] == "image/bmp"
-    assert response.content[:2] == b"BM"
+    assert response.headers["content-type"] == "image/png"
+    assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_image_can_still_be_served_as_bmp(tmp_path):
+    """The escape hatch, in case a firmware ever mishandles the PNG path."""
+    with make_client(tmp_path, image_format="bmp") as client:
+        token = client.app.state.image_token
+        api_key = client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+        body = client.get("/api/display", headers={"ID": MAC, "Access-Token": api_key}).json()
+        assert body["filename"].endswith(".bmp")
+
+        digest = client.app.state.store.current_digest()
+        response = client.get(f"/image/{token}/{digest}.bmp")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/bmp"
+        assert response.content[:2] == b"BM"
 
 
 def test_stale_filename_falls_back_to_the_current_screen(client):
     token = client.app.state.image_token
-    response = client.get(f"/image/{token}/0000000000000000.bmp")
+    response = client.get(f"/image/{token}/0000000000000000.png")
     assert response.status_code == 200
-    assert response.content[:2] == b"BM"
+    assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_a_filename_from_the_previous_format_still_resolves(client):
+    """After the BMP-to-PNG switch the device asks once for its cached name."""
+    token = client.app.state.image_token
+    digest = client.app.state.store.current_digest()
+    response = client.get(f"/image/{token}/{digest}.bmp")
+    assert response.status_code == 200
+    assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def test_preview_requires_the_token(client):

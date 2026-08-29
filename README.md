@@ -14,7 +14,7 @@ pointed at:
 ```
 device wakes  ──▶  GET /api/display  ──▶  { image_url, filename, refresh_rate }
                                             │
-                   GET /image/<token>/<hash>.bmp  ──▶  800×480 1-bit BMP
+                   GET /image/<token>/<hash>.png  ──▶  800×480 1-bit PNG
                                             │
                    sleeps for refresh_rate seconds
 ```
@@ -54,6 +54,33 @@ edge markers instead of widening it. A week with no events at all falls back to
 **Never a blank screen.** If a calendar cannot be fetched, its last known good
 copy is used and its name is marked in the header. A calendar server hiccup
 showing an empty week would be the worst possible failure.
+
+**The panel is wiped on a schedule.** A 1-bit image is drawn with a partial,
+flicker-free update, and a panel that only ever gets those slowly washes out.
+The firmware does have a guard — a full black/white refresh every eight partial
+ones — but its BMP branch resets that counter on every draw, so for a screen
+served as BMP the guard can never fire. This server drove its display that way
+for its first weeks, and the contrast visibly faded.
+
+Two things fix it. The screen is served as PNG, which is the branch where the
+firmware's own counter works — and which is about 2 KB against the BMP's fixed
+48 062 bytes.
+And rather than rely on that, every eighth redraw and the first redraw of each
+day set `maximum_compatibility` in the poll response, which is the firmware's
+oddly named switch for "wipe the panel properly this time". `FULL_REFRESH_EVERY`
+tunes the cadence; set it to 1 for a day to scrub a panel that has already
+faded. Only a redraw counts — when the image is unchanged the device keeps its
+cached copy and never touches the panel, so a wipe requested then would be
+spent on nothing.
+
+**The waveform profile is ours to set.** `TEMPERATURE_PROFILE` (`default`, `a`,
+`b`) is sent on every poll. It is the same knob as *Device settings → Firmware*
+on trmnl.com, which a BYOS device cannot reach. It has to be sent every time,
+because the firmware overwrites its stored value from each response — omitting
+the field pins the device to `default`. On the TRMNL OG only `a` changes
+anything for a purely 1-bit screen; `b` differs from the default in its
+greyscale mode alone. A change takes effect on the *next* redraw, since the
+firmware stores the new profile after drawing the current image.
 
 ## Calendar sources
 
@@ -187,7 +214,7 @@ for the display.
 | `GET/POST /api/setup` | Pairing; returns `api_key` and `friendly_id` |
 | `GET/POST /api/display` | Per-wake poll; returns image URL and sleep time |
 | `POST /api/log` | Firmware diagnostics, written to the service log |
-| `GET /image/<token>/<hash>.bmp` | The rendered screen |
+| `GET /image/<token>/<hash>.png` | The rendered screen |
 | `GET /preview/<token>.png` | The same screen as PNG, for a browser |
 | `POST /preview/<token>/refresh` | Force a calendar refresh |
 | `GET /healthz` | Liveness only, outside `URL_PREFIX` for the platform |

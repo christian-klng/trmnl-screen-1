@@ -5,7 +5,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.scheduler import build_scheduler, in_quiet_hours, refresh_rate_for, seconds_until
+from app.scheduler import (
+    build_scheduler,
+    full_refresh_due,
+    in_quiet_hours,
+    refresh_rate_for,
+    seconds_until,
+)
 
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -99,3 +105,68 @@ def test_morning_refresh_lands_on_a_half_hour():
     fields = {f.name: str(f) for f in trigger.fields}
     assert fields["hour"] == "4"
     assert fields["minute"] == "30"
+
+
+# --- full refresh cadence ---------------------------------------------------
+
+
+def due(**overrides) -> bool:
+    base = {
+        "changed": True,
+        "draws_since_full": 0,
+        "last_full_date": "2026-08-29",
+        "today": "2026-08-29",
+        "every": 8,
+    }
+    base.update(overrides)
+    return full_refresh_due(**base)
+
+
+def test_an_unchanged_screen_is_never_a_full_refresh():
+    """Not even when everything else says one is overdue: the device skips the
+    redraw entirely, so the request would go nowhere."""
+    assert due(changed=False) is False
+    assert due(changed=False, draws_since_full=99) is False
+    assert due(changed=False, last_full_date=None) is False
+
+
+def test_the_first_redraw_of_a_new_day_is_full():
+    assert due(last_full_date="2026-08-28") is True
+    assert due(last_full_date=None) is True
+
+
+def test_the_counter_fills_up_to_the_configured_cadence():
+    assert [due(draws_since_full=n) for n in range(8)] == [False] * 7 + [True]
+
+
+def test_a_cadence_of_one_makes_every_redraw_full():
+    assert due(draws_since_full=0, every=1) is True
+
+
+def test_a_lost_counter_does_not_stall_the_cadence():
+    """A counter somehow past the cadence has to fire, not wrap around."""
+    assert due(draws_since_full=40) is True
+
+
+# --- settings that reach the device -----------------------------------------
+
+
+def test_image_format_is_validated():
+    assert Settings(image_format="PNG").image_format == "png"
+    assert Settings(image_format=" bmp ").image_format == "bmp"
+    with pytest.raises(ValidationError):
+        Settings(image_format="jpeg")
+
+
+def test_temperature_profile_is_validated():
+    """Trying the profiles out is the point of the setting, so a typo must not
+    quietly read as "the profile made no difference"."""
+    assert Settings(temperature_profile="A").temperature_profile == "a"
+    with pytest.raises(ValidationError):
+        Settings(temperature_profile="c")
+
+
+def test_full_refresh_every_must_be_positive():
+    assert Settings(full_refresh_every=1).full_refresh_every == 1
+    with pytest.raises(ValidationError):
+        Settings(full_refresh_every=0)

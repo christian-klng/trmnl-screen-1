@@ -21,8 +21,8 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .refresh import ScreenState, refresh_screen
-from .render import render_message, to_bmp_bytes, to_png_bytes
-from .scheduler import build_scheduler, refresh_rate_for
+from .render import render_message, to_device_bytes, to_png_bytes
+from .scheduler import build_scheduler, full_refresh_due, refresh_rate_for
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
-    store = Store(settings.data_dir)
+    store = Store(settings.data_dir, settings.image_format)
     state = ScreenState()
 
     # Persisted so the image URL survives a restart; the device would otherwise
@@ -82,7 +82,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # A device polling before the first fetch completes must still get a
         # valid image rather than a 404.
         if store.current_digest() is None:
-            payload = to_bmp_bytes(render_message("trmnl-screen-1", ["Kalender wird geladen …"]))
+            payload = to_device_bytes(
+                render_message("trmnl-screen-1", ["Kalender wird geladen …"]), store.image_ext
+            )
             store.save_image(hashlib.sha1(payload).hexdigest()[:16], payload)
 
         task = asyncio.create_task(do_refresh())
@@ -92,7 +94,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # a variable that did not arrive the way it was meant to.
         log.info(
             "Started. data_dir=%s writable=%s url_prefix=%r caldav=%s ics=%s "
-            "allowed_macs=%d lock_first_pairing=%s fetch_at=:%s refresh=%ds quiet=%02d-%02d tz=%s",
+            "allowed_macs=%d lock_first_pairing=%s fetch_at=:%s refresh=%ds quiet=%02d-%02d tz=%s "
+            "image=%s full_refresh_every=%d temp_profile=%s",
             settings.data_dir,
             os.access(settings.data_dir, os.W_OK),
             settings.url_prefix or "(none)",
@@ -105,6 +108,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.quiet_start_hour,
             settings.quiet_end_hour,
             settings.timezone,
+            settings.image_format,
+            settings.full_refresh_every,
+            settings.temperature_profile,
         )
         log.info("Healthcheck on /healthz, detailed status on %s/status", settings.url_prefix)
         try:
@@ -135,7 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def image_url(request: Request) -> tuple[str, str]:
         digest = store.current_digest() or "pending"
-        filename = f"{digest}.bmp"
+        filename = f"{digest}.{store.image_ext}"
         return f"{base_url(request)}{settings.url_prefix}/image/{token}/{filename}", filename
 
     def reject_pairing(mac: str, request: Request) -> str | None:
@@ -213,17 +219,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         url, filename = image_url(request)
+
+        # Decide how the panel should be driven for this poll. The device only
+        # redraws when the filename differs from the one it last showed, so the
+        # full refresh has to ride along with a name it has not seen.
+        now = datetime.now(settings.tz)
+        changed = filename != device["last_filename"]
+        full_refresh = full_refresh_due(
+            changed=changed,
+            draws_since_full=device["draws_since_full"] or 0,
+            last_full_date=device["last_full_date"],
+            today=now.date().isoformat(),
+            every=settings.full_refresh_every,
+        )
+        if changed:
+            store.record_redraw(
+                mac, filename, full_refresh=full_refresh, today=now.date().isoformat()
+            )
+            log.info(
+                "Serving %s to %s as a %s refresh",
+                filename,
+                device["friendly_id"],
+                "full" if full_refresh else "partial",
+            )
+
         return JSONResponse(
             {
                 "status": 0,
                 "image_url": url,
                 "filename": filename,
-                "refresh_rate": refresh_rate_for(datetime.now(settings.tz), settings),
+                "refresh_rate": refresh_rate_for(now, settings),
                 "image_url_timeout": 0,
                 "update_firmware": False,
                 "firmware_url": None,
                 "reset_firmware": False,
                 "special_function": "none",
+                # Misleadingly named: what it actually does is force the slow
+                # black/white refresh instead of the silent partial one.
+                "maximum_compatibility": full_refresh,
+                "temperature_profile": settings.temperature_profile,
             }
         )
 
@@ -254,7 +288,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not secrets.compare_digest(supplied_token, token):
             raise HTTPException(status_code=404, detail="Not found")
 
-        digest = filename.removesuffix(".bmp")
+        digest = filename.rsplit(".", 1)[0]
         path = store.image_path(digest)
         if not path.exists():
             current = store.current_digest()
@@ -266,7 +300,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return Response(
             content=path.read_bytes(),
-            media_type="image/bmp",
+            media_type=f"image/{store.image_ext}",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -307,6 +341,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "last_error": state.last_error,
                 "caldav_configured": settings.caldav_configured,
                 "ics_sources": [name for name, _ in settings.ics_sources],
+                "image_format": settings.image_format,
+                "full_refresh_every": settings.full_refresh_every,
+                "temperature_profile": settings.temperature_profile,
                 "devices": [
                     {
                         "friendly_id": d["friendly_id"],
@@ -314,6 +351,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "battery": d["last_battery"],
                         "rssi": d["last_rssi"],
                         "firmware": d["last_firmware"],
+                        "draws_since_full_refresh": d["draws_since_full"],
+                        "last_full_refresh": d["last_full_date"],
                     }
                     for d in devices
                 ],

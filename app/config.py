@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     quiet_start_hour: int = 23
     quiet_end_hour: int = 5
 
+    # --- Panel health -------------------------------------------------------
+    # What the device downloads, "png" or "bmp". The choice matters far beyond
+    # file size; see render.to_device_bytes.
+    image_format: str = "png"
+    # Every Nth redraw is a full black/white refresh instead of a silent
+    # partial one. Without them the panel washes out over weeks. 8 is what the
+    # firmware does on its own when it is left to count.
+    full_refresh_every: int = 8
+    # Waveform profile the firmware should keep: "default", "a" or "b". We have
+    # to send this on every response — the firmware overwrites its stored value
+    # from each one, so omitting it pins the device to "default" forever.
+    temperature_profile: str = "default"
+
     # --- Fetching -----------------------------------------------------------
     # Minutes of the hour at which calendars are refreshed, comma separated.
     # Fixed minutes rather than an interval because the rendered image carries
@@ -105,6 +118,36 @@ class Settings(BaseSettings):
             if not minute.isdigit() or not 0 <= int(minute) <= 59:
                 raise ValueError(f"Not a minute of the hour: {minute!r}")
         return ",".join(str(int(m)) for m in minutes)
+
+    @field_validator("image_format")
+    @classmethod
+    def _validate_image_format(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ("png", "bmp"):
+            raise ValueError(f"IMAGE_FORMAT must be 'png' or 'bmp', not {v!r}")
+        return v
+
+    @field_validator("temperature_profile")
+    @classmethod
+    def _validate_temperature_profile(cls, v: str) -> str:
+        """The firmware only knows "a" and "b"; anything else means default.
+
+        Rejecting a typo here rather than silently treating it as the default
+        matters, because trying the profiles out is the whole point of the
+        setting — silently ignoring "A " would look like the profile made no
+        difference.
+        """
+        v = v.strip().lower()
+        if v not in ("default", "a", "b"):
+            raise ValueError(f"TEMPERATURE_PROFILE must be 'default', 'a' or 'b', not {v!r}")
+        return v
+
+    @field_validator("full_refresh_every")
+    @classmethod
+    def _validate_full_refresh_every(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("FULL_REFRESH_EVERY must be at least 1")
+        return v
 
     @field_validator("url_prefix")
     @classmethod

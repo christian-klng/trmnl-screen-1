@@ -13,7 +13,7 @@ from .config import Settings
 from .events import Event, clip_and_dedupe, expand_calendar
 from .ics_source import fetch_ics_sources
 from .layout import build_layout
-from .render import render_message, render_week, to_bmp_bytes
+from .render import render_message, render_week, to_device_bytes
 from .store import Store
 from .week import current_week
 
@@ -124,7 +124,7 @@ def _store_image(
     stale: list[str],
     event_count: int,
 ) -> ScreenState:
-    payload = to_bmp_bytes(image)
+    payload = to_device_bytes(image, store.image_ext)
     digest = hashlib.sha1(payload).hexdigest()[:16]
 
     # An unchanged digest means the device keeps its cached image and the

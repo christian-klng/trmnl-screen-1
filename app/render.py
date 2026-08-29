@@ -337,7 +337,7 @@ def render_message(title: str, lines: list[str]) -> Image.Image:
 
 
 def to_bmp_bytes(image: Image.Image) -> bytes:
-    """1-bit BMP3, the format the firmware handles most reliably."""
+    """1-bit BMP3. Kept as a fallback; see to_device_bytes for why not to use it."""
     import io
 
     mono = image.convert("1", dither=Image.Dither.NONE)
@@ -347,9 +347,33 @@ def to_bmp_bytes(image: Image.Image) -> bytes:
 
 
 def to_png_bytes(image: Image.Image) -> bytes:
+    """1-bit greyscale PNG.
+
+    Pillow writes mode "1" as bit depth 1, colour type 0, no palette. The
+    firmware copies those bits straight into the panel plane, and its
+    convention (a set bit is white) is the same one the BMP raster uses, so
+    the two formats put identical pixels on the glass.
+    """
     import io
 
     mono = image.convert("1", dither=Image.Dither.NONE)
     buffer = io.BytesIO()
     mono.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def to_device_bytes(image: Image.Image, image_format: str) -> bytes:
+    """The bytes the device downloads.
+
+    PNG, and not for the size — a typical week is about 2 KB against the BMP's
+    fixed 48 062 bytes, welcome as that is on a battery-powered radio.
+
+    The firmware's BMP branch ends with ``iUpdateCount = 1`` on every single
+    draw, and two lines later decides whether to flash the panel with
+    ``(iUpdateCount & 7) == 0``. That test can therefore never be true, so a
+    device fed BMPs performs partial, flicker-free updates forever and slowly
+    washes out. The PNG branch leaves the counter alone and the every-eighth
+    full refresh happens as intended. We no longer depend on that — see
+    FULL_REFRESH_EVERY — but there is no reason to keep fighting it.
+    """
+    return to_png_bytes(image) if image_format == "png" else to_bmp_bytes(image)

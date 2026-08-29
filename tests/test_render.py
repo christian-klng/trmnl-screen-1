@@ -16,6 +16,8 @@ from app.render import (
     render_message,
     render_week,
     to_bmp_bytes,
+    to_device_bytes,
+    to_png_bytes,
     wrap_text,
 )
 from app.week import current_week
@@ -132,3 +134,54 @@ def test_identical_input_renders_byte_identical_output():
     first = to_bmp_bytes(render_week(layout, NOW, TZ))
     second = to_bmp_bytes(render_week(layout, NOW, TZ))
     assert first == second
+
+
+# --- what the device actually downloads ------------------------------------
+#
+# The firmware's BMP branch pins its partial-update counter to 1 on every draw,
+# so the "full refresh every 8 partials" test two lines later can never be
+# true and the panel is never wiped. PNG leaves the counter alone — and is two
+# orders of magnitude smaller on a battery-powered radio.
+
+
+def test_png_is_one_bit_greyscale_without_a_palette():
+    """The polarity the firmware assumes.
+
+    It copies these bits straight into the panel plane and only consults a
+    palette when there is one. A palette-carrying PNG would be read through a
+    different branch, so the encoding matters, not just the pixels.
+    """
+    import struct
+
+    layout = build_layout([event(0, 9, 10, "Standup")], WEEK, TZ, generated_at=NOW)
+    payload = to_png_bytes(render_week(layout, NOW, TZ))
+
+    assert payload[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height, bit_depth, colour_type = struct.unpack_from(">IIBB", payload, 16)
+    assert (width, height) == (WIDTH, HEIGHT)
+    assert bit_depth == 1
+    assert colour_type == 0  # greyscale, so a set bit is white
+    assert b"PLTE" not in payload
+
+
+def test_png_and_bmp_carry_the_same_pixels():
+    layout = build_layout([event(1, 14, 16, "Review")], WEEK, TZ, generated_at=NOW)
+    image = render_week(layout, NOW, TZ)
+    with (
+        Image.open(io.BytesIO(to_png_bytes(image))) as png,
+        Image.open(io.BytesIO(to_bmp_bytes(image))) as bmp,
+    ):
+        assert png.convert("1").tobytes() == bmp.convert("1").tobytes()
+
+
+def test_png_is_far_smaller_than_the_bmp():
+    layout = build_layout([event(d, 9, 10, f"Tag {d}") for d in range(7)], WEEK, TZ, generated_at=NOW)
+    image = render_week(layout, NOW, TZ)
+    # The BMP is a fixed 48062 bytes whatever is on the screen.
+    assert len(to_png_bytes(image)) * 10 < len(to_bmp_bytes(image))
+
+
+def test_to_device_bytes_picks_the_configured_format():
+    image = render_message("Titel", [])
+    assert to_device_bytes(image, "png")[:8] == b"\x89PNG\r\n\x1a\n"
+    assert to_device_bytes(image, "bmp")[:2] == b"BM"

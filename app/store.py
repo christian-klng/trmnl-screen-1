@@ -37,16 +37,29 @@ CREATE TABLE IF NOT EXISTS calendar_cache (
 );
 """
 
+# Columns added to `devices` after the first deploy. CREATE TABLE IF NOT EXISTS
+# leaves an existing table alone, and the live database sits on a volume that
+# outlives every deploy, so these have to be added by hand on start-up.
+LATER_DEVICE_COLUMNS = {
+    "last_filename": "TEXT",
+    "draws_since_full": "INTEGER NOT NULL DEFAULT 0",
+    "last_full_date": "TEXT",
+}
+
 
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
 
 
 class Store:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, image_ext: str = "png") -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "state.db"
+        # The single source of truth for the served format: whoever renders
+        # asks the store rather than reading the setting a second time, so the
+        # bytes on disk and the filename in the API response cannot disagree.
+        self.image_ext = image_ext
         self._lock = threading.Lock()
         self._init_schema()
 
@@ -58,6 +71,10 @@ class Store:
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(SCHEMA)
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+            for column, definition in LATER_DEVICE_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE devices ADD COLUMN {column} {definition}")
             # Without auto_vacuum SQLite never returns freed pages to the
             # filesystem, so the file only ever grows. Enabling it on an
             # existing database requires one VACUUM, which also reclaims
@@ -97,6 +114,29 @@ class Store:
                    WHERE mac = ?""",
                 (_utcnow(), battery, rssi, firmware, mac),
             )
+
+    def record_redraw(self, mac: str, filename: str, *, full_refresh: bool, today: str) -> None:
+        """Note that ``filename`` was handed out and the panel will be redrawn.
+
+        Only called when the name actually changed: an unchanged name means the
+        device keeps its cached copy and never touches the panel, and counting
+        that as a redraw would spread the full refreshes ever further apart.
+        """
+        with self._lock, self._connect() as conn:
+            if full_refresh:
+                conn.execute(
+                    """UPDATE devices
+                       SET last_filename = ?, draws_since_full = 0, last_full_date = ?
+                       WHERE mac = ?""",
+                    (filename, today, mac),
+                )
+            else:
+                conn.execute(
+                    """UPDATE devices
+                       SET last_filename = ?, draws_since_full = COALESCE(draws_since_full, 0) + 1
+                       WHERE mac = ?""",
+                    (filename, mac),
+                )
 
     def list_devices(self) -> list[dict]:
         with self._lock, self._connect() as conn:
@@ -155,7 +195,7 @@ class Store:
     # --- rendered screen --------------------------------------------------
 
     def image_path(self, digest: str) -> Path:
-        return self.data_dir / f"screen-{digest}.bmp"
+        return self.data_dir / f"screen-{digest}.{self.image_ext}"
 
     def save_image(self, digest: str, payload: bytes, keep: int = 3) -> Path:
         path = self.image_path(digest)
@@ -165,7 +205,14 @@ class Store:
         tmp.replace(path)
         self.set_kv("current_digest", digest)
 
-        images = sorted(self.data_dir.glob("screen-*.bmp"), key=lambda p: p.stat().st_mtime, reverse=True)
+        # Every extension, not just the current one, so that switching the
+        # served format leaves the old screens behind to age out rather than
+        # stranding them on the volume forever.
+        images = sorted(
+            (p for p in self.data_dir.glob("screen-*") if p.suffix != ".tmp"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         for stale in images[keep:]:
             stale.unlink(missing_ok=True)
         return path
