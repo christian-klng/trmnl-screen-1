@@ -82,6 +82,14 @@ anything for a purely 1-bit screen; `b` differs from the default in its
 greyscale mode alone. A change takes effect on the *next* redraw, since the
 firmware stores the new profile after drawing the current image.
 
+**Firmware updates come from here too.** Set `FIRMWARE_TARGET` (say `1.8.16`)
+and the next poll tells the device to update itself: it downloads TRMNL's
+release image into its spare app partition, verifies it and reboots into it.
+WiFi and the server URL are kept, which a USB flash would erase. The firmware
+compares no versions — told to update, it would reflash the same image on every
+poll — so the offer is made only while the device reports an older version,
+never as a downgrade, and at most once per `FIRMWARE_RETRY_HOURS`.
+
 ## Calendar sources
 
 Two kinds, and they can be combined:

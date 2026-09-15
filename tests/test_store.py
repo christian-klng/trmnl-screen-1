@@ -3,6 +3,8 @@ have to reach a file that already exists — CREATE TABLE IF NOT EXISTS will not
 do it, and a paired device must not be lost on the way."""
 
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.store import LATER_DEVICE_COLUMNS, Store
 
@@ -74,6 +76,16 @@ def test_a_redraw_counts_and_a_full_refresh_resets(tmp_path):
     assert device["draws_since_full"] == 0
     assert device["last_full_date"] == "2026-08-29"
     assert device["last_filename"] == "b.png"
+
+
+def test_a_firmware_offer_is_remembered_in_utc(tmp_path):
+    old_database(tmp_path)
+    store = Store(tmp_path)
+    assert store.get_device(MAC)["last_firmware_offer"] is None
+
+    local = datetime(2026, 9, 15, 12, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+    store.record_firmware_offer(MAC, local)
+    assert store.get_device(MAC)["last_firmware_offer"] == "2026-09-15T10:00:00+00:00"
 
 
 # --- rendered screens on disk ----------------------------------------------

@@ -44,6 +44,7 @@ LATER_DEVICE_COLUMNS = {
     "last_filename": "TEXT",
     "draws_since_full": "INTEGER NOT NULL DEFAULT 0",
     "last_full_date": "TEXT",
+    "last_firmware_offer": "TEXT",
 }
 
 
@@ -137,6 +138,14 @@ class Store:
                        WHERE mac = ?""",
                     (filename, mac),
                 )
+
+    def record_firmware_offer(self, mac: str, when: datetime) -> None:
+        """Remember when this device was last told to update its firmware."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE devices SET last_firmware_offer = ? WHERE mac = ?",
+                (when.astimezone(UTC).isoformat(), mac),
+            )
 
     def list_devices(self) -> list[dict]:
         with self._lock, self._connect() as conn:

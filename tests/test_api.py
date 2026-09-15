@@ -296,6 +296,101 @@ def test_the_temperature_profile_is_sent_on_every_response(tmp_path):
         assert poll(client, api_key)["temperature_profile"] == "a"
 
 
+# --- over-the-air firmware updates ------------------------------------------
+#
+# The firmware installs whatever it is pointed at and compares no versions, so
+# every guard against a reflash loop or a downgrade lives on this side.
+
+OTA_IMAGE = "https://trmnl-fw.s3.us-east-2.amazonaws.com/trmnl_og/FW1.8.16.bin"
+
+
+def poll_as(client, api_key, firmware):
+    headers = {"ID": MAC, "Access-Token": api_key}
+    if firmware is not None:
+        headers["FW-Version"] = firmware
+    return client.get("/api/display", headers=headers).json()
+
+
+def pair(client):
+    return client.get("/api/setup", headers={"ID": MAC}).json()["api_key"]
+
+
+def test_no_update_is_offered_without_a_target(client):
+    body = poll_as(client, pair(client), "1.8.12")
+    assert body["update_firmware"] is False
+    assert body["firmware_url"] is None
+
+
+def test_an_older_device_is_told_to_update_itself(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        body = poll_as(client, pair(client), "1.8.12")
+        assert body["update_firmware"] is True
+        assert body["firmware_url"] == OTA_IMAGE
+
+
+def test_the_offer_stops_once_the_device_reports_the_target(tmp_path):
+    """The reflash loop: without this the device would download and flash the
+    same image on every poll."""
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        api_key = pair(client)
+        assert poll_as(client, api_key, "1.8.12")["update_firmware"] is True
+        # It flashes, reboots and polls again straight away.
+        body = poll_as(client, api_key, "1.8.16")
+        assert body["update_firmware"] is False
+        assert body["firmware_url"] is None
+
+
+def test_a_failed_update_is_not_offered_again_straight_away(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        api_key = pair(client)
+        assert poll_as(client, api_key, "1.8.12")["update_firmware"] is True
+        for _ in range(5):
+            assert poll_as(client, api_key, "1.8.12")["update_firmware"] is False
+
+
+def test_the_retry_window_survives_a_restart(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        api_key = pair(client)
+        poll_as(client, api_key, "1.8.12")
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        assert poll_as(client, api_key, "1.8.12")["update_firmware"] is False
+
+
+def test_a_device_that_reports_no_version_is_not_flashed(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        assert poll_as(client, pair(client), None)["update_firmware"] is False
+
+
+def test_a_newer_device_is_never_downgraded(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        assert poll_as(client, pair(client), "1.8.17")["update_firmware"] is False
+
+
+def test_a_custom_firmware_url_is_used(tmp_path):
+    url = "https://example.test/fw/custom.bin"
+    with make_client(tmp_path, firmware_target="1.8.16", firmware_url=url) as client:
+        assert poll_as(client, pair(client), "1.8.12")["firmware_url"] == url
+
+
+def test_an_update_does_not_disturb_the_screen(tmp_path):
+    """The image is drawn before the firmware updates, so the poll that offers
+    an update must still carry the normal screen and refresh decision."""
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        body = poll_as(client, pair(client), "1.8.12")
+        assert body["filename"].endswith(".png")
+        assert body["maximum_compatibility"] is True
+
+
+def test_status_reports_the_firmware_rollout(tmp_path):
+    with make_client(tmp_path, firmware_target="1.8.16") as client:
+        poll_as(client, pair(client), "1.8.12")
+        body = client.get("/status").json()
+        assert body["firmware_target"] == "1.8.16"
+        device = body["devices"][0]
+        assert device["firmware"] == "1.8.12"
+        assert device["last_firmware_offer"] is not None
+
+
 # --- image delivery ------------------------------------------------------
 
 

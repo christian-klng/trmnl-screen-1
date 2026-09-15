@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .firmware import release_url
 
 
 class Settings(BaseSettings):
@@ -50,6 +53,19 @@ class Settings(BaseSettings):
     # to send this on every response — the firmware overwrites its stored value
     # from each one, so omitting it pins the device to "default" forever.
     temperature_profile: str = "default"
+
+    # --- Firmware -----------------------------------------------------------
+    # Version the device should run, e.g. "1.8.16". Empty means no update is
+    # ever offered. The device updates itself over WiFi on its next poll and
+    # keeps its WiFi and server settings; see app/firmware.py.
+    firmware_target: str = ""
+    # Where to download it. Empty means TRMNL's own release image for
+    # FIRMWARE_TARGET, which is what it should almost always be.
+    firmware_url: str = ""
+    # Minimum gap between two offers to the same device. Covers an image that
+    # installs but keeps reporting the old version, which would otherwise be
+    # downloaded and flashed on every poll.
+    firmware_retry_hours: int = 6
 
     # --- Fetching -----------------------------------------------------------
     # Minutes of the hour at which calendars are refreshed, comma separated.
@@ -149,11 +165,50 @@ class Settings(BaseSettings):
             raise ValueError("FULL_REFRESH_EVERY must be at least 1")
         return v
 
+    @field_validator("firmware_target")
+    @classmethod
+    def _normalise_firmware_target(cls, v: str) -> str:
+        """Accept "1.8.16", "v1.8.16" or "FW1.8.16"; keep the bare number.
+
+        The bare number is what the device reports. A target in any other shape
+        would not parse, and the update would silently never be offered.
+        """
+        v = v.strip()
+        for prefix in ("FW", "fw", "v", "V"):
+            if v.startswith(prefix):
+                v = v[len(prefix):]
+                break
+        if v and not re.fullmatch(r"\d+\.\d+\.\d+", v):
+            raise ValueError(f"FIRMWARE_TARGET must look like 1.8.16, not {v!r}")
+        return v
+
+    @field_validator("firmware_url")
+    @classmethod
+    def _validate_firmware_url(cls, v: str) -> str:
+        v = v.strip()
+        if v and not v.startswith("https://"):
+            raise ValueError("FIRMWARE_URL must be an https:// URL")
+        return v
+
+    @field_validator("firmware_retry_hours")
+    @classmethod
+    def _validate_firmware_retry_hours(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("FIRMWARE_RETRY_HOURS must be at least 1")
+        return v
+
     @field_validator("url_prefix")
     @classmethod
     def _normalise_prefix(cls, v: str) -> str:
         v = v.strip().strip("/")
         return f"/{v}" if v else ""
+
+    @property
+    def firmware_download_url(self) -> str:
+        """The image a device is pointed at, or "" when no update is configured."""
+        if not self.firmware_target:
+            return ""
+        return self.firmware_url or release_url(self.firmware_target)
 
     @property
     def tz(self) -> ZoneInfo:

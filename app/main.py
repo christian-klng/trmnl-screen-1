@@ -14,12 +14,13 @@ import os
 import secrets
 import string
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
+from .firmware import update_due as firmware_update_due
 from .refresh import ScreenState, refresh_screen
 from .render import render_message, to_device_bytes, to_png_bytes
 from .scheduler import build_scheduler, full_refresh_due, refresh_rate_for
@@ -95,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.info(
             "Started. data_dir=%s writable=%s url_prefix=%r caldav=%s ics=%s "
             "allowed_macs=%d lock_first_pairing=%s fetch_at=:%s refresh=%ds quiet=%02d-%02d tz=%s "
-            "image=%s full_refresh_every=%d temp_profile=%s",
+            "image=%s full_refresh_every=%d temp_profile=%s firmware_target=%s",
             settings.data_dir,
             os.access(settings.data_dir, os.W_OK),
             settings.url_prefix or "(none)",
@@ -111,6 +112,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.image_format,
             settings.full_refresh_every,
             settings.temperature_profile,
+            settings.firmware_target or "(none)",
         )
         log.info("Healthcheck on /healthz, detailed status on %s/status", settings.url_prefix)
         try:
@@ -243,6 +245,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "full" if full_refresh else "partial",
             )
 
+        # Firmware: offered only while the device reports an older version. The
+        # firmware itself compares nothing and, told to update, would reflash the
+        # same image on every poll.
+        reported = request.headers.get("fw-version")
+        if reported and device["last_firmware"] and reported != device["last_firmware"]:
+            log.info(
+                "%s now runs firmware %s (was %s)",
+                device["friendly_id"],
+                reported,
+                device["last_firmware"],
+            )
+        last_offer = device["last_firmware_offer"]
+        offer_update = firmware_update_due(
+            reported=reported,
+            target=settings.firmware_target,
+            last_offer=datetime.fromisoformat(last_offer) if last_offer else None,
+            now=now,
+            retry_after=timedelta(hours=settings.firmware_retry_hours),
+        )
+        if offer_update:
+            store.record_firmware_offer(mac, now)
+            log.info(
+                "Offering firmware %s to %s (reports %s)",
+                settings.firmware_target,
+                device["friendly_id"],
+                reported,
+            )
+
         return JSONResponse(
             {
                 "status": 0,
@@ -250,8 +280,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "filename": filename,
                 "refresh_rate": refresh_rate_for(now, settings),
                 "image_url_timeout": 0,
-                "update_firmware": False,
-                "firmware_url": None,
+                "update_firmware": offer_update,
+                "firmware_url": settings.firmware_download_url if offer_update else None,
                 "reset_firmware": False,
                 "special_function": "none",
                 # Misleadingly named: what it actually does is force the slow
@@ -344,6 +374,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "image_format": settings.image_format,
                 "full_refresh_every": settings.full_refresh_every,
                 "temperature_profile": settings.temperature_profile,
+                "firmware_target": settings.firmware_target or None,
                 "devices": [
                     {
                         "friendly_id": d["friendly_id"],
@@ -353,6 +384,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "firmware": d["last_firmware"],
                         "draws_since_full_refresh": d["draws_since_full"],
                         "last_full_refresh": d["last_full_date"],
+                        "last_firmware_offer": d["last_firmware_offer"],
                     }
                     for d in devices
                 ],
