@@ -73,14 +73,31 @@ faded. Only a redraw counts — when the image is unchanged the device keeps its
 cached copy and never touches the panel, so a wipe requested then would be
 spent on nothing.
 
-**The waveform profile is ours to set.** `TEMPERATURE_PROFILE` (`default`, `a`,
-`b`) is sent on every poll. It is the same knob as *Device settings → Firmware*
-on trmnl.com, which a BYOS device cannot reach. It has to be sent every time,
-because the firmware overwrites its stored value from each response — omitting
-the field pins the device to `default`. On the TRMNL OG only `a` changes
-anything for a purely 1-bit screen; `b` differs from the default in its
-greyscale mode alone. A change takes effect on the *next* redraw, since the
-firmware stores the new profile after drawing the current image.
+**The waveform profile is ours to set, and this panel needs `a`.**
+`TEMPERATURE_PROFILE` (`default`, `a`, `b`) rides along on every poll — the same
+knob as *Device settings → Firmware* on trmnl.com, which a BYOS device cannot
+reach. It has to be sent every time, because the firmware overwrites its stored
+value from each response, and it takes effect on the *next* redraw, since the
+profile is stored only after the current image has been drawn.
+
+It is not cosmetic. Under `default` the panel type is `EP75_800x480`, and
+`png_to_epd()` writes the second memory plane — the controller's copy of the
+*old* image — only when the type differs from exactly that:
+
+```c
+if (bbep.getPanelType() != EP75_800x480) { bbep.startWrite(PLANE_1); ... }
+```
+
+The display is cut from power between polls, so by the next wake that plane
+holds noise. A full refresh drives every pixel along its old→new transition, so
+under `default` it drives them from noise: the screen comes back pale, at worst
+unreadable, and the partial updates that follow claw it back over the next few
+hours. The signature is unmistakable once you have seen it — the screen looks
+worst right after a wipe and best just before the next one. Under `a` (panel
+type `EP75_800x480_GEN2`) the firmware writes the inverted image into that
+plane, every pixel gets a defined full transition, and the wipe comes out
+crisp. `b` buys nothing here: for a purely 1-bit screen on the OG it maps to the
+same panel type as `default`.
 
 **Firmware updates come from here too.** Set `FIRMWARE_TARGET` (say `1.8.16`)
 and the next poll tells the device to update itself: it downloads TRMNL's
