@@ -8,12 +8,12 @@ MAC = "AA:BB:CC:DD:EE:FF"
 
 
 def make_client(tmp_path, **overrides):
+    overrides.setdefault("public_base_url", "https://example.test")
     settings = Settings(
         data_dir=tmp_path,
         caldav_url="",
         caldav_username="",
         caldav_password="",
-        public_base_url="https://example.test",
         **overrides,
     )
     app = create_app(settings)
@@ -478,7 +478,7 @@ def test_status_reports_state(client):
 # --- the platform healthcheck ---------------------------------------------
 #
 # Regression: /healthz used to live on the prefixed router, so setting
-# URL_PREFIX moved it and Railway's healthcheck got a 404 on every attempt.
+# URL_PREFIX moved it and the platform healthcheck got a 404 on every attempt.
 
 
 def test_healthz_stays_at_the_root_without_a_prefix(client):
@@ -508,15 +508,17 @@ def test_detailed_status_stays_behind_the_prefix(tmp_path):
         assert client.get("/s/geheim/status").status_code == 200
 
 
-def test_railway_healthcheck_path_matches_a_real_route(tmp_path):
-    """railway.toml and the code have to agree — they did not, and the deploy
-    failed on every healthcheck attempt."""
+def test_dockerfile_healthcheck_path_matches_a_real_route(tmp_path):
+    """The Dockerfile's HEALTHCHECK and the code have to agree — they once did
+    not, and the deploy failed on every healthcheck attempt."""
     import re
     from pathlib import Path
 
-    config = (Path(__file__).resolve().parent.parent / "railway.toml").read_text()
-    match = re.search(r'healthcheckPath\s*=\s*"([^"]+)"', config)
-    assert match, "railway.toml must declare a healthcheckPath"
+    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text()
+    healthcheck = re.search(r"^HEALTHCHECK\b(?:.*\\\n)*.*$", dockerfile, re.MULTILINE)
+    assert healthcheck, "the Dockerfile must declare a HEALTHCHECK"
+    match = re.search(r"'(/[^']*)'", healthcheck.group(0))
+    assert match, "the HEALTHCHECK must request a path"
     path = match.group(1)
 
     # It has to answer both with and without a prefix configured.
@@ -524,6 +526,17 @@ def test_railway_healthcheck_path_matches_a_real_route(tmp_path):
         assert client.get(path).status_code == 200
     with make_client(tmp_path / "prefixed", url_prefix="/s/geheim") as client:
         assert client.get(path).status_code == 200
+
+
+def test_base_url_falls_back_to_forwarded_headers(tmp_path):
+    """Without PUBLIC_BASE_URL the image URL follows the reverse proxy, so the
+    device is never handed the container's internal http://host:8000."""
+    with make_client(tmp_path, public_base_url="") as client:
+        body = client.get(
+            "/api/setup",
+            headers={"ID": MAC, "X-Forwarded-Proto": "https", "X-Forwarded-Host": "trmnl.example.org"},
+        ).json()
+        assert body["image_url"].startswith("https://trmnl.example.org/image/")
 
 
 def test_image_token_survives_a_restart(tmp_path):

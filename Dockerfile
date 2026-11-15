@@ -17,5 +17,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY fonts ./fonts
 
-# Railway injects PORT. The default keeps `docker run` usable as-is.
+EXPOSE 8000
+
+# /healthz sits outside URL_PREFIX on purpose — the platform cannot be given
+# the secret path. Python rather than curl because the slim image ships
+# neither curl nor wget, and a healthcheck that cannot run marks every
+# deployment unhealthy. The generous start period covers the first calendar
+# fetch at startup.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8000') + '/healthz', timeout=4)"
+
+# PORT is optional; the default matches EXPOSE and keeps `docker run` usable.
 CMD ["sh", "-c", "uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]

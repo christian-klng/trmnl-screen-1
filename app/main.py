@@ -135,8 +135,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def base_url(request: Request) -> str:
         if settings.public_base_url:
             return settings.public_base_url.rstrip("/")
-        if settings.railway_public_domain:
-            return f"https://{settings.railway_public_domain}"
         proto = request.headers.get("x-forwarded-proto", request.url.scheme)
         host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         return f"{proto}://{host}" if host else str(request.base_url).rstrip("/")

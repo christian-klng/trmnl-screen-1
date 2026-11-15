@@ -185,24 +185,33 @@ Tests:
 .venv/bin/python -m pytest
 ```
 
-## Deploying to Railway
+## Deploying to Coolify
 
-1. Push this repository and create a Railway service from it. The
-   `Dockerfile` and `railway.toml` are picked up automatically.
-2. **Attach a volume** and set `DATA_DIR` to its mount path (e.g. `/data`).
-   Railway's filesystem is ephemeral — without a volume the device's `api_key`
-   is lost on every deploy and the display silently unpairs.
-   If the container ever runs as a non-root user, also set `RAILWAY_RUN_UID=0`,
-   since volumes are mounted as root.
-3. **Turn Serverless off** for this service. Railway considers a service idle
-   after ten minutes without *outbound* traffic, and the first request to a
-   slept service can return 502 — which the display would see as a failed poll.
-   This is not optional: calendars are fetched on the half hour, so nothing
-   else keeps the service awake between polls.
+1. Create an application from this repository with the **Dockerfile** build
+   pack, branch `main`, and *Ports Exposes* set to `8000`. Turn on automatic
+   deployment on push if you like.
+2. **Add persistent storage** mounted at `/data`, which is where `DATA_DIR`
+   points by default. A container's filesystem is replaced on every deploy —
+   without a volume the device's `api_key` is lost and the display silently
+   unpairs.
+3. Give the application a domain, e.g. `https://trmnl.example.org`, with a DNS
+   record pointing at the server. Coolify's proxy obtains the certificate,
+   which needs port 80 reachable. An own domain also means the display never
+   has to be re-pointed when the server moves.
 4. Set the environment variables from `.env.example`, including calendar
-   sources and a `URL_PREFIX`.
-5. Generate a public domain. That URL plus `URL_PREFIX` is what the display
-   gets in pairing mode.
+   sources, a `URL_PREFIX`, and `PUBLIC_BASE_URL` set to that domain.
+5. The healthcheck is the `HEALTHCHECK` in the `Dockerfile`, against `/healthz`.
+   Leave Coolify's own healthcheck switched off: it runs `curl` or `wget`
+   inside the container, and the slim image has neither, so every deploy
+   would be marked unhealthy.
+
+The server has to keep running between polls — calendars are fetched on the
+half hour, so a host that puts idle services to sleep would answer the
+display's poll with a cold start, which the firmware sees as a failed poll.
+
+Coolify does not back up application volumes. `state.db` is small and can be
+rebuilt by pairing again, but copying it off now and then saves the image
+token and the last-known-good calendars.
 
 ## Pairing the display
 
@@ -215,7 +224,7 @@ fields. That shapes what pairing protection can look like, because `/api/setup`
 is otherwise open to anyone who finds the host:
 
 1. **`URL_PREFIX`** — mount everything under a secret path and hand the device
-   `https://your-app.up.railway.app/s/<long-random-string>`. The URL becomes the
+   `https://trmnl.example.org/s/<long-random-string>`. The URL becomes the
    credential. This is the only mechanism that keeps the endpoints from being
    discoverable at all.
 2. **`ALLOWED_MACS`** — only listed MAC addresses may register. The MAC is not a

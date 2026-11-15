@@ -1,7 +1,8 @@
 """Persistence.
 
-Everything here has to survive a redeploy. Railway's filesystem is ephemeral,
-so this database and the rendered image live on a mounted volume. Losing the
+Everything here has to survive a redeploy. A container's filesystem is
+replaced on every deploy, so this database and the rendered image live on a
+mounted volume. Losing the
 device's api_key would silently unpair the display on every deploy.
 """
 
