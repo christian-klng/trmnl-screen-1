@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .firmware import release_url
@@ -73,10 +73,8 @@ class Settings(BaseSettings):
     # an HH:MM stamp: on an interval that stamp drifts, on fixed minutes it
     # always reads a tidy value and the screen updates predictably.
     #
-    # Note the trade-off against Railway's serverless mode, which considers a
-    # service idle after ten minutes without outbound traffic: with gaps longer
-    # than that, the device's poll may hit a cold start. Keep app sleeping
-    # switched off for this service, or narrow the gaps here.
+    # The server has to stay up between refreshes: a host that puts idle
+    # services to sleep would answer the device's poll with a cold start.
     fetch_at_minutes: str = "0,30"
 
     # --- Week window --------------------------------------------------------
@@ -91,10 +89,10 @@ class Settings(BaseSettings):
     # --- Runtime ------------------------------------------------------------
     timezone: str = "Europe/Berlin"
     data_dir: Path = Path("/data")
-    # Absolute base URL the device should use. Left empty it is derived from
-    # RAILWAY_PUBLIC_DOMAIN, then from the incoming request.
+    # Absolute base URL the device should use. Set it in production. Left
+    # empty it is derived from the incoming request and the proxy's
+    # X-Forwarded-* headers.
     public_base_url: str = ""
-    railway_public_domain: str = Field(default="", alias="RAILWAY_PUBLIC_DOMAIN")
     # Guards /image and /preview. Generated and persisted on first start.
     image_token: str = ""
     log_level: str = "INFO"

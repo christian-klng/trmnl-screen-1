@@ -7,7 +7,7 @@ __pycache__/
 # Secrets
 .env
 
-# Local runtime state (on Railway this lives on the mounted volume)
+# Local runtime state (in production this lives on the mounted volume)
 data/
 *.db
 

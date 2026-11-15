@@ -76,10 +76,10 @@ def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
     HH:MM stamp: on an interval it drifts across the hour, on fixed minutes it
     always reads the same tidy values.
 
-    The gap between refreshes is now longer than the ten minutes after which
-    Railway's serverless mode considers a service idle — app sleeping has to
-    stay switched off for this service, or the device's poll can hit a cold
-    start and see a 502 as a failed poll.
+    The gap between refreshes is long, and nothing else keeps the process busy
+    in between. It has to run on a host that does not put idle services to
+    sleep, or the device's poll can hit a cold start and see a 502 as a failed
+    poll.
     """
     scheduler = AsyncIOScheduler(timezone=settings.tz)
 
