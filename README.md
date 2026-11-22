@@ -266,5 +266,7 @@ returns.
 
 ## Licence
 
+The code is released under the [MIT License](LICENSE).
+
 The vendored Barlow Condensed fonts in `fonts/` are covered by the SIL Open
 Font License, [included here](fonts/LICENSE.barlow).
