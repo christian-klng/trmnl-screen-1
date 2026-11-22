@@ -1,92 +1,51 @@
 import io
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from dataclasses import replace
+from datetime import date
 
-from PIL import Image, ImageFont
+import pytest
+from PIL import Image, ImageDraw
 
-from app.events import Event
-from app.layout import build_layout
 from app.render import (
     BOLD,
     HEIGHT,
-    REGULAR,
+    MEDIUM,
+    SEMIBOLD,
+    SIDE_WIDTH,
+    WEEKDAYS,
     WIDTH,
-    column_x,
-    fit_text,
+    deg,
+    draw_icon,
+    fitted,
+    millimetres,
+    rain_line,
     render_message,
-    render_week,
+    render_weather,
     to_bmp_bytes,
     to_device_bytes,
     to_png_bytes,
-    wrap_text,
+    wind_line,
 )
-from app.week import current_week
+from app.sample import sample_forecast
+from app.weather import SEVERITY, parse_forecast
 
-TZ = ZoneInfo("Europe/Berlin")
-NOW = datetime(2026, 8, 5, 10, 30, tzinfo=TZ)
-WEEK = current_week(NOW, TZ)
+# A Thursday: the longest weekday is the one shown large.
+THURSDAY = date(2026, 11, 26)
+DAYS = parse_forecast(sample_forecast(THURSDAY))
+MAIN = DAYS[THURSDAY]
+SIDE = DAYS[date(2026, 11, 27)]
 
 
-def event(day: int, start_h: float, end_h: float, summary: str = "Termin", all_day: bool = False) -> Event:
-    base = datetime(2026, 8, 3, 0, 0, tzinfo=TZ) + timedelta(days=day)
-    return Event(
-        uid=f"{day}-{start_h}-{summary}",
-        summary=summary,
-        start=base + timedelta(hours=start_h),
-        end=base + timedelta(hours=end_h),
-        all_day=all_day,
-        calendar="Privat",
-    )
+def screen(**kwargs) -> Image.Image:
+    return render_weather(MAIN, SIDE, **kwargs)
 
 
 def test_fonts_are_vendored():
-    assert REGULAR.exists(), "font must ship with the repo for deterministic rendering"
-    assert BOLD.exists()
-
-
-def test_column_boundaries_cover_the_full_width():
-    assert column_x(0) == 32
-    assert column_x(7) == WIDTH
-    widths = [column_x(i + 1) - column_x(i) for i in range(7)]
-    assert sum(widths) == WIDTH - 32
-    # No column may be more than a pixel off from its neighbours.
-    assert max(widths) - min(widths) <= 1
-
-
-def test_fit_text_truncates_with_an_ellipsis():
-    font = ImageFont.truetype(str(REGULAR), 11)
-    assert fit_text("kurz", font, 200) == "kurz"
-    long = fit_text("Projektbesprechung mit dem Team", font, 40)
-    assert long.endswith("…")
-    assert font.getlength(long) <= 40
-
-
-def test_fit_text_handles_impossibly_narrow_boxes():
-    font = ImageFont.truetype(str(REGULAR), 11)
-    assert fit_text("Termin", font, 1) == ""
-
-
-def test_wrap_text_respects_the_line_limit():
-    font = ImageFont.truetype(str(REGULAR), 11)
-    lines = wrap_text("Ein ziemlich langer Titel fuer eine schmale Spalte", font, 60, 2)
-    assert len(lines) <= 2
-    for line in lines:
-        assert font.getlength(line) <= 60
-
-
-def test_wrap_text_marks_dropped_words_with_an_ellipsis():
-    font = ImageFont.truetype(str(REGULAR), 11)
-    lines = wrap_text("Alpha Beta Gamma Delta Epsilon Zeta Eta Theta", font, 50, 1)
-    assert len(lines) == 1
-    assert lines[0].endswith("…")
+    for path in (BOLD, SEMIBOLD, MEDIUM):
+        assert path.exists(), "fonts must ship with the repo for deterministic rendering"
 
 
 def test_render_produces_a_valid_one_bit_bmp():
-    events = [event(d, 9, 10, f"Tag {d}") for d in range(7)]
-    layout = build_layout(events, WEEK, TZ, generated_at=NOW)
-    image = render_week(layout, NOW, TZ)
-    payload = to_bmp_bytes(image)
-
+    payload = to_bmp_bytes(screen())
     assert payload[:2] == b"BM"
     with Image.open(io.BytesIO(payload)) as decoded:
         assert decoded.size == (WIDTH, HEIGHT)
@@ -94,31 +53,69 @@ def test_render_produces_a_valid_one_bit_bmp():
 
 
 def test_rendered_screen_has_both_black_and_white_pixels():
-    layout = build_layout([event(0, 9, 10, "Standup")], WEEK, TZ, generated_at=NOW)
-    mono = render_week(layout, NOW, TZ).convert("1", dither=Image.Dither.NONE)
-    colours = {c for _, c in mono.getcolors()}
-    assert colours == {0, 255}
+    mono = screen().convert("1", dither=Image.Dither.NONE)
+    assert {c for _, c in mono.getcolors()} == {0, 255}
 
 
-def test_render_survives_an_empty_week():
-    layout = build_layout([], WEEK, TZ, generated_at=NOW)
-    payload = to_bmp_bytes(render_week(layout, NOW, TZ))
-    with Image.open(io.BytesIO(payload)) as decoded:
-        assert decoded.size == (WIDTH, HEIGHT)
+def test_identical_input_renders_byte_identical_output():
+    """The digest is the device's cache key, so rendering must be deterministic."""
+    assert to_png_bytes(screen()) == to_png_bytes(screen())
 
 
-def test_render_survives_a_heavily_overlapping_day():
-    events = [event(2, 9 + i * 0.25, 12, f"Parallel {i}") for i in range(8)]
-    layout = build_layout(events, WEEK, TZ, generated_at=NOW)
-    payload = to_bmp_bytes(render_week(layout, NOW, TZ))
-    assert payload[:2] == b"BM"
+def test_a_stale_forecast_is_marked():
+    assert to_png_bytes(screen(stale_note="Daten von 14:00 · offline")) != to_png_bytes(screen())
 
 
-def test_render_handles_a_full_all_day_band():
-    events = [event(d, 0, 24, f"Ganztag {d}", all_day=True) for d in range(5)]
-    layout = build_layout(events, WEEK, TZ, generated_at=NOW)
-    payload = to_bmp_bytes(render_week(layout, NOW, TZ))
-    assert payload[:2] == b"BM"
+def test_every_weekday_fits_the_narrow_column():
+    for name in WEEKDAYS:
+        assert fitted(BOLD, 62, name, SIDE_WIDTH).getlength(name) <= SIDE_WIDTH
+
+
+def test_the_longest_weekday_keeps_its_full_size_on_the_left():
+    """Donnerstag at 108 px is the whole point of the screen."""
+    assert fitted(BOLD, 108, "Donnerstag", 486).size == 108
+
+
+def test_extreme_values_render():
+    hot = replace(MAIN, temp_max=38, feel_max=41, temp_min=24, wind=88, gusts=130, precip_sum=56.0)
+    frost = replace(SIDE, temp_max=-14, temp_min=-21, feel_max=-22)
+    assert to_png_bytes(render_weather(hot, frost))[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_a_part_of_the_day_without_data_renders():
+    patchy = replace(MAIN, parts=(None, *MAIN.parts[1:]))
+    assert to_png_bytes(render_weather(patchy, SIDE)) != to_png_bytes(screen())
+
+
+@pytest.mark.parametrize("kind", [*SEVERITY, "moon", "partly_night", "unknown"])
+def test_every_icon_draws_something(kind):
+    image = Image.new("L", (100, 100), 255)
+    draw_icon(ImageDraw.Draw(image), kind, 0, 0, 100)
+    assert image.getextrema() == (0, 255)
+
+
+def test_temperatures_use_a_real_minus_sign():
+    assert deg(-3) == "−3°"
+    assert deg(0) == "0°"
+    assert deg(12) == "12°"
+
+
+def test_rain_amounts_read_naturally():
+    assert millimetres(0.0) == "0 mm"
+    assert millimetres(0.3) == "0,3 mm"
+    assert millimetres(4.2) == "4 mm"
+    assert millimetres(2.5) == "3 mm"
+
+
+def test_rain_line_without_a_probability():
+    assert rain_line(replace(MAIN, precip_probability=None)) == "Regen 4 mm"
+    assert rain_line(MAIN) == "Regen 70 % · 4 mm"
+
+
+def test_wind_line_shows_gusts_only_when_they_add_something():
+    assert wind_line(MAIN) == "Wind 25–45 km/h"
+    assert wind_line(replace(MAIN, gusts=None)) == "Wind 25 km/h"
+    assert wind_line(replace(MAIN, gusts=25)) == "Wind 25 km/h"
 
 
 def test_message_screen_renders():
@@ -126,14 +123,6 @@ def test_message_screen_renders():
     with Image.open(io.BytesIO(payload)) as decoded:
         assert decoded.size == (WIDTH, HEIGHT)
         assert decoded.mode == "1"
-
-
-def test_identical_input_renders_byte_identical_output():
-    """The digest is the device's cache key, so rendering must be deterministic."""
-    layout = build_layout([event(0, 9, 10, "Standup")], WEEK, TZ, generated_at=NOW)
-    first = to_bmp_bytes(render_week(layout, NOW, TZ))
-    second = to_bmp_bytes(render_week(layout, NOW, TZ))
-    assert first == second
 
 
 # --- what the device actually downloads ------------------------------------
@@ -153,8 +142,7 @@ def test_png_is_one_bit_greyscale_without_a_palette():
     """
     import struct
 
-    layout = build_layout([event(0, 9, 10, "Standup")], WEEK, TZ, generated_at=NOW)
-    payload = to_png_bytes(render_week(layout, NOW, TZ))
+    payload = to_png_bytes(screen())
 
     assert payload[:8] == b"\x89PNG\r\n\x1a\n"
     width, height, bit_depth, colour_type = struct.unpack_from(">IIBB", payload, 16)
@@ -165,8 +153,7 @@ def test_png_is_one_bit_greyscale_without_a_palette():
 
 
 def test_png_and_bmp_carry_the_same_pixels():
-    layout = build_layout([event(1, 14, 16, "Review")], WEEK, TZ, generated_at=NOW)
-    image = render_week(layout, NOW, TZ)
+    image = screen()
     with (
         Image.open(io.BytesIO(to_png_bytes(image))) as png,
         Image.open(io.BytesIO(to_bmp_bytes(image))) as bmp,
@@ -175,10 +162,9 @@ def test_png_and_bmp_carry_the_same_pixels():
 
 
 def test_png_is_far_smaller_than_the_bmp():
-    layout = build_layout([event(d, 9, 10, f"Tag {d}") for d in range(7)], WEEK, TZ, generated_at=NOW)
-    image = render_week(layout, NOW, TZ)
+    image = screen()
     # The BMP is a fixed 48062 bytes whatever is on the screen.
-    assert len(to_png_bytes(image)) * 10 < len(to_bmp_bytes(image))
+    assert len(to_png_bytes(image)) * 4 < len(to_bmp_bytes(image))
 
 
 def test_to_device_bytes_picks_the_configured_format():

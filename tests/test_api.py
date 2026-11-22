@@ -1,22 +1,30 @@
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.sample import sample_forecast
 
 MAC = "AA:BB:CC:DD:EE:FF"
+TZ = ZoneInfo("Europe/Berlin")
 
 
-def make_client(tmp_path, **overrides):
+def fake_fetch(settings):
+    """The sample forecast, starting today, so no test ever touches the network."""
+    return sample_forecast(datetime.now(TZ).date())
+
+
+def failing_fetch(settings):
+    raise OSError("weather service unreachable")
+
+
+def make_client(tmp_path, fetch=fake_fetch, **overrides):
     overrides.setdefault("public_base_url", "https://example.test")
-    settings = Settings(
-        data_dir=tmp_path,
-        caldav_url="",
-        caldav_username="",
-        caldav_password="",
-        **overrides,
-    )
-    app = create_app(settings)
+    settings = Settings(data_dir=tmp_path, **overrides)
+    app = create_app(settings, fetch=fetch)
     return TestClient(app)
 
 
@@ -214,7 +222,7 @@ def poll(client, api_key, mac=MAC):
 
 
 def redraw(client, digest):
-    """Pretend the week changed: a new digest is a new filename."""
+    """Pretend the forecast changed: a new digest is a new filename."""
     client.app.state.store.save_image(digest, b"not really an image")
 
 
@@ -471,8 +479,57 @@ def test_status_reports_state(client):
     client.get("/api/setup", headers={"ID": MAC})
     body = client.get("/status").json()
     assert body["ok"] is True
-    assert body["caldav_configured"] is False
+    assert body["last_error"] is None
+    assert body["forecast_fetched_at"] is not None
+    assert len(body["shown_days"]) == 2
+    assert body["day_switch_hour"] == 20
+    assert body["location"] == {"latitude": 52.4886, "longitude": 13.4697}
     assert len(body["devices"]) == 1
+
+
+# --- the forecast -----------------------------------------------------------
+
+
+def refreshed(client) -> str:
+    """Run a refresh to completion; the one at start-up runs in the background."""
+    token = client.app.state.image_token
+    return client.post(f"/preview/{token}/refresh").json()["digest"]
+
+
+def test_the_forecast_is_kept_for_when_the_service_is_down(tmp_path):
+    with make_client(tmp_path) as client:
+        good = refreshed(client)
+
+    with make_client(tmp_path, fetch=failing_fetch) as client:
+        # A forecast a moment old is not worth a mark, so the screen is unchanged.
+        assert refreshed(client) == good
+        assert "unreachable" in client.get("/status").json()["last_error"]
+
+
+def test_an_old_forecast_is_marked_on_the_screen(tmp_path):
+    with make_client(tmp_path) as client:
+        good = refreshed(client)
+        raw, _ = client.app.state.store.load_forecast()
+        client.app.state.store.save_forecast(raw, datetime.now(TZ) - timedelta(hours=4))
+
+    with make_client(tmp_path, fetch=failing_fetch) as client:
+        assert refreshed(client) != good
+
+
+def test_no_forecast_at_all_still_serves_a_screen(tmp_path):
+    with make_client(tmp_path, fetch=failing_fetch) as client:
+        token = client.app.state.image_token
+        digest = client.app.state.store.current_digest()
+        response = client.get(f"/image/{token}/{digest}.png")
+        assert response.status_code == 200
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_a_forced_refresh_reports_the_days_shown(client):
+    token = client.app.state.image_token
+    body = client.post(f"/preview/{token}/refresh").json()
+    assert body["digest"]
+    assert len(body["shown_days"]) == 2
 
 
 # --- the platform healthcheck ---------------------------------------------

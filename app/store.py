@@ -30,13 +30,11 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS calendar_cache (
-    name       TEXT PRIMARY KEY,
-    documents  TEXT NOT NULL,
-    fetched_at TEXT NOT NULL
-);
 """
+
+# Left behind by the calendar this screen used to show. Calendar exports could
+# run to megabytes, so the table is dropped rather than left on the volume.
+OBSOLETE_TABLES = ("calendar_cache",)
 
 # Columns added to `devices` after the first deploy. CREATE TABLE IF NOT EXISTS
 # leaves an existing table alone, and the live database sits on a volume that
@@ -73,6 +71,8 @@ class Store:
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(SCHEMA)
+            for table in OBSOLETE_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
             existing = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
             for column, definition in LATER_DEVICE_COLUMNS.items():
                 if column not in existing:
@@ -168,39 +168,26 @@ class Store:
                 (key, value),
             )
 
-    # --- last known good calendar data ------------------------------------
+    # --- last known good forecast ------------------------------------------
 
-    def save_calendar(self, name: str, documents: list[str]) -> None:
-        payload = json.dumps(documents)
+    def save_forecast(self, raw: dict, fetched_at: datetime) -> None:
+        """Keep the last forecast that parsed, for when the service is down."""
         with self._lock, self._connect() as conn:
-            # A calendar export can be megabytes, and any UPDATE rewrites the
-            # whole row. Rewriting an unchanged blob every fetch makes the
-            # database file grow through fragmentation, so skip it entirely.
-            row = conn.execute(
-                "SELECT documents FROM calendar_cache WHERE name = ?", (name,)
-            ).fetchone()
-            if row and row["documents"] == payload:
-                return
-            conn.execute(
-                "INSERT INTO calendar_cache (name, documents, fetched_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(name) DO UPDATE SET documents = excluded.documents, "
-                "fetched_at = excluded.fetched_at",
-                (name, payload, _utcnow()),
+            conn.executemany(
+                "INSERT INTO kv (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [
+                    ("forecast", json.dumps(raw)),
+                    ("forecast_fetched_at", fetched_at.astimezone(UTC).isoformat()),
+                ],
             )
 
-    def list_cached_calendars(self) -> list[str]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute("SELECT name FROM calendar_cache ORDER BY name").fetchall()
-        return [r["name"] for r in rows]
-
-    def load_calendar(self, name: str) -> tuple[list[str], str] | None:
-        with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT documents, fetched_at FROM calendar_cache WHERE name = ?", (name,)
-            ).fetchone()
-        if not row:
+    def load_forecast(self) -> tuple[dict, datetime] | None:
+        raw = self.get_kv("forecast")
+        fetched_at = self.get_kv("forecast_fetched_at")
+        if not raw or not fetched_at:
             return None
-        return json.loads(row["documents"]), row["fetched_at"]
+        return json.loads(raw), datetime.fromisoformat(fetched_at)
 
     # --- rendered screen --------------------------------------------------
 

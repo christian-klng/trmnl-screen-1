@@ -1,10 +1,10 @@
 # trmnl-screen-1
 
-A small BYOS ("bring your own server") backend for a **TRMNL OG** e-ink display.
-It aggregates several calendars over CalDAV and renders them as a
-Monday-to-Sunday week grid: 800×480, 1 bit, no browser involved.
+A small BYOS ("bring your own server") backend for a **TRMNL OG** e-ink display
+on a kitchen table. It shows the weather for one day large and the day after
+it small: 800×480, 1 bit, no browser involved.
 
-![week layout](docs/preview.png)
+![weather screen](docs/preview.png)
 
 ## How it works
 
@@ -19,41 +19,67 @@ device wakes  ──▶  GET /api/display  ──▶  { image_url, filename, ref
                    sleeps for refresh_rate seconds
 ```
 
-Meanwhile the server refreshes calendar data on its own schedule:
+Meanwhile the server refreshes the forecast on its own schedule:
 
 ```
-:00 and :30  ──▶  CalDAV fetch  ──▶  expand recurrences  ──▶  layout  ──▶  render
+:00 and :30  ──▶  Open-Meteo  ──▶  pick the two days  ──▶  render
 ```
 
 `filename` is the device's cache key, so it is set to a hash of the image
-content. When nothing in the week changed, the device recognises the unchanged
+content. When the forecast did not change, the device recognises the unchanged
 name, skips the download and does not redraw the panel at all — which saves both
 battery and e-ink wear.
+
+## What the screen shows
+
+On the left, large, the day that matters: its weekday in 108 px type, the date,
+an icon, the day's high, the felt high, rain chance and amount, wind and gusts,
+and a short description. Under a rule, four parts of the day — *Früh* (6–10),
+*Mittag* (10–14), *Nachmittag* (14–18), *Abend* (18–22) — each with an icon,
+the temperature and, smaller, the felt temperature. On the right, the day after
+it: weekday, date, icon, high and low, description, rain and wind.
+
+Until 20:00 that is today and tomorrow. From 20:00 on it is tomorrow and the
+day after: in the evening, tomorrow's weather is what counts at the kitchen
+table. `DAY_SWITCH_HOUR` moves the switch.
 
 ## Design notes
 
 **No headless browser.** Terminus and `byos_node_lite` render HTML through
-Chrome. A week grid is pure geometry, so Pillow draws it directly: a much
-smaller image, ~50 ms per render, and crisper type — anti-aliased browser text
-has to be thresholded down to 1 bit, which is exactly what makes small type look
-muddy on e-ink. Here it is drawn unantialiased from the start.
+Chrome. This screen is a handful of text lines and icons, so Pillow draws it
+directly: a much smaller image, a render in milliseconds, and crisper type —
+anti-aliased browser text has to be thresholded down to 1 bit, which is exactly
+what makes type look muddy on e-ink. Here it is drawn unantialiased from the
+start, and the icons are drawn from circles and lines rather than taken from an
+icon font, so they come out clean at every size.
 
-**The grid is tight, on purpose.** Seven columns across 800 px leaves 109 px per
-day, roughly 17 characters. Two parallel events halve that. Long titles are
-wrapped, and words too long for a column are broken rather than ellipsised
-mid-title — an ellipsis in the middle would suggest the title ends there while
-the next line carries on.
+**Weekdays, never "today".** The image drawn at 20:00 stays on the panel through
+the night while the device sleeps. A label saying "tomorrow" would be wrong from
+midnight on; "Freitag" stays right. So the screen names days only by weekday and
+date.
 
-**Adaptive time window.** Rather than a fixed 07:00–21:00, the grid zooms to the
-hours actually used that week, with a minimum span of 8 h so a quiet week is not
-stretched absurdly and a maximum of 15 h so one 04:00 flight cannot ruin the
-resolution of every other day. Events outside the window are shown as `↑n` / `↓n`
-edge markers instead of widening it. A week with no events at all falls back to
-08:00–16:00.
+**No clock on the screen.** A "last updated 14:30" stamp would change the image
+on every refresh, and every changed image is a redraw of the panel. Without it
+the image changes only when the forecast does. Temperatures are whole degrees
+for the same reason, besides being what anyone reads off a kitchen display.
 
-**Never a blank screen.** If a calendar cannot be fetched, its last known good
-copy is used and its name is marked in the header. A calendar server hiccup
-showing an empty week would be the worst possible failure.
+**The device wakes for the switch.** The server renders the next day at 20:00
+on the dot. With a 15-minute poll interval the display would pick that up as
+late as 20:15, so in the last stretch before the switch the device is told to
+sleep only until 20:01.
+
+**Parts of the day take their worst hour.** One rainy hour out of four decides
+whether to take an umbrella, so a part shows the most severe weather of its
+hours rather than the most common. *Früh* shows its coldest hour rather than an
+average, because it stands in for the day's low, which the large block does not
+repeat. A part that is mostly after dark gets a moon instead of a sun.
+
+**Never a blank screen.** The last forecast that parsed is kept on the volume.
+If Open-Meteo cannot be reached, that copy is drawn instead, and once it is more
+than three hours old a black bar in the corner says how old. A single failed
+fetch earns no mark, because the bar would only make the image flip back and
+forth. A response that is not a usable forecast counts as a failed fetch and
+never overwrites the good copy.
 
 **The panel is wiped on a schedule.** A 1-bit image is drawn with a partial,
 flicker-free update, and a panel that only ever gets those slowly washes out.
@@ -107,63 +133,40 @@ compares no versions — told to update, it would reflash the same image on ever
 poll — so the offer is made only while the device reports an older version,
 never as a downgrade, and at most once per `FIRMWARE_RETRY_HOURS`.
 
-## Calendar sources
+## Weather data
 
-Two kinds, and they can be combined:
+[Open-Meteo](https://open-meteo.com) — free for non-commercial use, no API key,
+and for Germany its default model blend is DWD's ICON. One request a refresh
+returns three days of daily and hourly values in local time. Open-Meteo
+recomputes its forecast about once an hour, so refreshing on `:00` and `:30`
+picks up every new run without hammering a free service.
 
-- **CalDAV** (`CALDAV_URL`, `CALDAV_USERNAME`, `CALDAV_PASSWORD`) — Nextcloud or
-  any CalDAV server, using an app password.
-- **Direct ICS/webcal URLs** (`ICS_URLS`) — fetched on our own schedule.
-
-The second exists to route around a slow intermediary. A Google calendar
-subscribed inside Nextcloud is only as fresh as Nextcloud's subscription job,
-which defaults to once a day and needs shell access to change. Pointing at
-Google's secret iCal address directly puts it back on our own half-hourly cycle.
-`webcal://` URLs are rewritten to `https://` automatically.
-
-A response that is not iCalendar — a login or error page, say — is treated as a
-failure rather than as an empty calendar, so a broken URL cannot silently erase
-those events from the screen.
+The location defaults to Treptower Park in Berlin. Set `LATITUDE` and
+`LONGITUDE` for anywhere else.
 
 ## Configuration
 
 All settings come from environment variables; see [`.env.example`](.env.example).
-At least one of the CalDAV trio or `ICS_URLS` must be set.
+Nothing is required: without any variable the server shows Treptower Park.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CALDAV_CALENDARS` | *(all)* | Comma-separated display names, up to 5 |
-| `ICS_URLS` | *(none)* | `Name=URL`, comma separated |
+| `LATITUDE` / `LONGITUDE` | `52.4886` / `13.4697` | Where the forecast is for |
+| `DAY_SWITCH_HOUR` | `20` | From this hour the next day is shown; `24` never switches early |
 | `DATA_DIR` | `/data` | Must be persistent (see below) |
 | `URL_PREFIX` | *(none)* | Mount the API under a secret path |
 | `ALLOWED_MACS` | *(any)* | MAC allowlist for pairing |
 | `LOCK_AFTER_FIRST_PAIRING` | `true` | Refuse a second device |
 | `PAIRING_SECRET` | *(none)* | Header/query secret; the firmware cannot send one |
 | `DISPLAY_REFRESH_SECONDS` | `900` | Device sleep between polls |
-| `FETCH_AT_MINUTES` | `0,30` | Minutes of the hour to refresh calendars on |
+| `FETCH_AT_MINUTES` | `0,30` | Minutes of the hour to refresh the forecast on |
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `23` / `5` | Overnight sleep |
-| `WEEK_SWITCH_WEEKDAY` / `WEEK_SWITCH_HOUR` | `6` / `12` | Sunday noon flips to next week |
-| `GRID_MIN_HOURS` / `GRID_MAX_HOURS` | `8` / `15` | Adaptive window bounds |
+| `FULL_REFRESH_EVERY` | `8` | Every Nth redraw wipes the panel |
+| `TEMPERATURE_PROFILE` | `default` | Waveform profile; this panel needs `a` |
+| `FIRMWARE_TARGET` | *(none)* | Firmware version to update the device to |
 
-## Nextcloud setup
-
-Google calendars are subscribed inside Nextcloud, so this server only ever
-speaks CalDAV. Two Nextcloud settings decide whether that actually works:
-
-```bash
-# Subscribed calendars refresh very rarely by default.
-php occ config:app:set dav calendarSubscriptionRefreshRate --value "PT15M"
-```
-
-**Background jobs must be set to system cron**, not AJAX
-(*Administration → Basic settings*). With AJAX the refresh job only runs while
-somebody has the web UI open, so subscribed calendars effectively never update.
-
-Be aware of the resulting chain for Google events: Google's ICS export cache →
-Nextcloud's refresh job → this server's half-hourly fetch → the device's
-15-minute poll. Calendars living natively in Nextcloud are on the display
-within about 45 minutes; Google events are slower, and by how much is up to
-Google's cache.
+Variables from the calendar version of this server (`CALDAV_*`, `ICS_URLS`,
+`WEEK_SWITCH_*`, `GRID_*`) are ignored and can be deleted.
 
 ## Running locally
 
@@ -173,7 +176,7 @@ cp .env.example .env          # then edit it
 DATA_DIR=./data .venv/bin/uvicorn app.main:create_app --factory --reload
 ```
 
-Render a sample week without a server or a device:
+Render the screen from sample data without a server or a device:
 
 ```bash
 .venv/bin/python scripts/preview_sample.py preview.png
@@ -198,20 +201,21 @@ Tests:
    record pointing at the server. Coolify's proxy obtains the certificate,
    which needs port 80 reachable. An own domain also means the display never
    has to be re-pointed when the server moves.
-4. Set the environment variables from `.env.example`, including calendar
-   sources, a `URL_PREFIX`, and `PUBLIC_BASE_URL` set to that domain.
+4. Set the environment variables from `.env.example`: at least a
+   `URL_PREFIX` and `PUBLIC_BASE_URL` set to that domain, plus the location if
+   it is not Treptower Park.
 5. The healthcheck is the `HEALTHCHECK` in the `Dockerfile`, against `/healthz`.
    Leave Coolify's own healthcheck switched off: it runs `curl` or `wget`
    inside the container, and the slim image has neither, so every deploy
    would be marked unhealthy.
 
-The server has to keep running between polls — calendars are fetched on the
+The server has to keep running between polls — the forecast is fetched on the
 half hour, so a host that puts idle services to sleep would answer the
 display's poll with a cold start, which the firmware sees as a failed poll.
 
 Coolify does not back up application volumes. `state.db` is small and can be
 rebuilt by pairing again, but copying it off now and then saves the image
-token and the last-known-good calendars.
+token and the last-known-good forecast.
 
 ## Pairing the display
 
@@ -250,16 +254,17 @@ for the display.
 | `POST /api/log` | Firmware diagnostics, written to the service log |
 | `GET /image/<token>/<hash>.png` | The rendered screen |
 | `GET /preview/<token>.png` | The same screen as PNG, for a browser |
-| `POST /preview/<token>/refresh` | Force a calendar refresh |
+| `POST /preview/<token>/refresh` | Force a forecast refresh |
 | `GET /healthz` | Liveness only, outside `URL_PREFIX` for the platform |
-| `GET /status` | Render state, stale calendars, device telemetry |
+| `GET /status` | Days shown, forecast age, last error, device telemetry |
 
-`/image`, `/preview` and `/status` carry the contents of your calendar, so they are
-guarded by an unguessable token generated on first start. Retrieve it from the
+`/image` and `/preview` are guarded by an unguessable token generated on first
+start, and `/status` sits behind `URL_PREFIX` because it exposes the location
+and device telemetry. Retrieve it from the
 `kv` table in `state.db`, or read it from the `image_url` that `/api/setup`
 returns.
 
 ## Licence
 
-The vendored DejaVu Sans Condensed fonts in `fonts/` are covered by
-[their own licence](fonts/LICENSE.dejavu).
+The vendored Barlow Condensed fonts in `fonts/` are covered by the SIL Open
+Font License, [included here](fonts/LICENSE.barlow).

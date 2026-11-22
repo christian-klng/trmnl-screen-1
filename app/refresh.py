@@ -1,129 +1,96 @@
-"""Fetch, normalise, lay out and render — the whole pipeline in one place."""
+"""Fetch, pick the days, render — the whole pipeline in one place."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .caldav_source import fetch_calendars
+from PIL import Image
+
 from .config import Settings
-from .events import Event, clip_and_dedupe, expand_calendar
-from .ics_source import fetch_ics_sources
-from .layout import build_layout
-from .render import render_message, render_week, to_device_bytes
+from .day import shown_days
+from .render import render_message, render_weather, to_device_bytes
 from .store import Store
-from .week import current_week
+from .weather import fetch_forecast, parse_forecast
 
 log = logging.getLogger(__name__)
+
+# How old the forecast may get before the screen says so. A single failed
+# fetch is not worth a mark: it would only flip the image back and forth, and
+# every flip is a redraw of the panel.
+STALE_AFTER = timedelta(hours=3)
+
+Fetcher = Callable[[Settings], dict]
 
 
 @dataclass
 class ScreenState:
     digest: str | None = None
     generated_at: datetime | None = None
-    stale_calendars: list[str] = field(default_factory=list)
-    event_count: int = 0
+    forecast_fetched_at: datetime | None = None
+    shown_days: list[str] = field(default_factory=list)
     last_error: str | None = None
 
 
-async def refresh_screen(settings: Settings, store: Store, state: ScreenState) -> ScreenState:
-    tz = settings.tz
-    now = datetime.now(tz)
-    window = current_week(now, tz, settings.week_switch_weekday, settings.week_switch_hour)
-
-    if not settings.any_source_configured:
-        image = render_message(
-            "Kein Kalender konfiguriert",
-            [
-                "CALDAV_URL / CALDAV_USERNAME / CALDAV_PASSWORD oder ICS_URLS setzen.",
-                "Danach aktualisiert sich diese Anzeige automatisch.",
-            ],
-        )
-        return _store_image(store, state, image, now, [], 0)
-
-    documents: dict[str, list[str]] = {}
-    failed: list[str] = []
-    errors: list[str] = []
-
-    if settings.caldav_configured:
-        try:
-            result = await asyncio.to_thread(
-                fetch_calendars,
-                settings.caldav_url,
-                settings.caldav_username,
-                settings.caldav_password,
-                window.start,
-                window.end,
-                settings.calendar_names or None,
-            )
-            documents.update(result.documents)
-            failed.extend(result.failed)
-        except Exception as exc:  # noqa: BLE001 - the server being down must not blank the screen
-            log.exception("CalDAV fetch failed entirely")
-            errors.append(f"CalDAV: {exc}")
-            # Nothing was fetched, so every CalDAV calendar we know about falls
-            # back to its cached copy.
-            failed.extend(settings.calendar_names or store.list_cached_calendars())
-
-    if settings.ics_sources:
-        ics_result = await asyncio.to_thread(fetch_ics_sources, settings.ics_sources)
-        documents.update(ics_result.documents)
-        failed.extend(ics_result.failed)
-        if ics_result.failed:
-            errors.append(f"ICS: {', '.join(ics_result.failed)}")
-
-    state.last_error = " | ".join(errors) if errors else None
-
-    # A total CalDAV failure falls back to every cached calendar name, which now
-    # includes the ICS ones. Anything we did fetch is not failed, whatever the
-    # other source type did.
-    failed = [name for name in dict.fromkeys(failed) if name not in documents]
-
-    for name, docs in documents.items():
-        store.save_calendar(name, docs)
-
-    stale: list[str] = []
-    for name in failed:
-        cached = store.load_calendar(name)
-        if cached:
-            documents[name] = cached[0]
-            stale.append(name)
-            log.warning("Using last known good data for calendar %r", name)
-        else:
-            stale.append(name)
-            log.warning("Calendar %r failed and has no cached copy", name)
-
-    events: list[Event] = []
-    for name, docs in documents.items():
-        for doc in docs:
-            events.extend(expand_calendar(doc, name, window.start, window.end, tz))
-
-    events = clip_and_dedupe(events, window.start, window.end)
-
-    layout = build_layout(
-        events,
-        window,
-        tz,
-        min_hours=settings.grid_min_hours,
-        max_hours=settings.grid_max_hours,
-        stale_calendars=sorted(set(stale)),
-        generated_at=now,
-    )
-    image = render_week(layout, now, tz)
-    return _store_image(store, state, image, now, sorted(set(stale)), len(events))
+def stale_note(fetched_at: datetime, now: datetime) -> str | None:
+    """The banner for an old forecast, or None while it is fresh enough."""
+    if now - fetched_at < STALE_AFTER:
+        return None
+    local = fetched_at.astimezone(now.tzinfo)
+    if local.date() == now.date():
+        return f"Daten von {local:%H:%M} · offline"
+    return f"Daten vom {local:%d.%m. %H:%M} · offline"
 
 
-def _store_image(
+async def refresh_screen(
+    settings: Settings,
     store: Store,
     state: ScreenState,
-    image,
-    now: datetime,
-    stale: list[str],
-    event_count: int,
+    fetch: Fetcher = fetch_forecast,
 ) -> ScreenState:
+    tz = settings.tz
+    now = datetime.now(tz)
+
+    try:
+        raw = await asyncio.to_thread(fetch, settings)
+        days = parse_forecast(raw)
+        store.save_forecast(raw, now)
+        fetched_at = now
+        state.last_error = None
+    except Exception as exc:  # noqa: BLE001 - the weather service being down must not blank the screen
+        log.warning("Forecast fetch failed: %s", exc)
+        state.last_error = str(exc) or type(exc).__name__
+        cached = store.load_forecast()
+        if cached is None:
+            image = render_message(
+                "Wetter nicht erreichbar",
+                ["Der Wetterdienst antwortet gerade nicht.", "Die Anzeige versucht es weiter."],
+            )
+            return _store_image(store, state, image, now)
+        raw, fetched_at = cached
+        days = parse_forecast(raw)
+        log.warning("Using the forecast from %s", fetched_at.isoformat())
+
+    main_day, next_day = shown_days(now, tz, settings.day_switch_hour)
+    state.forecast_fetched_at = fetched_at
+    state.shown_days = [main_day.isoformat(), next_day.isoformat()]
+
+    if main_day not in days or next_day not in days:
+        image = render_message(
+            "Keine aktuellen Wetterdaten",
+            [f"Die letzte Vorhersage ist vom {fetched_at.astimezone(tz):%d.%m.%Y}."],
+        )
+        return _store_image(store, state, image, now)
+
+    image = render_weather(days[main_day], days[next_day], stale_note(fetched_at, now))
+    return _store_image(store, state, image, now)
+
+
+def _store_image(store: Store, state: ScreenState, image: Image.Image, now: datetime) -> ScreenState:
     payload = to_device_bytes(image, store.image_ext)
     digest = hashlib.sha1(payload).hexdigest()[:16]
 
@@ -131,12 +98,10 @@ def _store_image(
     # e-ink panel is not redrawn at all.
     if digest != store.current_digest():
         store.save_image(digest, payload)
-        log.info("Rendered new screen %s (%d events)", digest, event_count)
+        log.info("Rendered new screen %s", digest)
     else:
         log.info("Screen unchanged (%s), device will use its cache", digest)
 
     state.digest = digest
     state.generated_at = now
-    state.stale_calendars = stale
-    state.event_count = event_count
     return state

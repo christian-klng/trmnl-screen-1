@@ -21,10 +21,11 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .firmware import update_due as firmware_update_due
-from .refresh import ScreenState, refresh_screen
+from .refresh import Fetcher, ScreenState, refresh_screen
 from .render import render_message, to_device_bytes, to_png_bytes
 from .scheduler import build_scheduler, full_refresh_due, refresh_rate_for
 from .store import Store
+from .weather import fetch_forecast
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +56,8 @@ def _as_int(value: str | None) -> int | None:
         return None
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, fetch: Fetcher = fetch_forecast) -> FastAPI:
+    """Build the app. ``fetch`` is the forecast source, swapped out in tests."""
     settings = settings or get_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -74,7 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def do_refresh() -> None:
         try:
-            await refresh_screen(settings, store, state)
+            await refresh_screen(settings, store, state, fetch)
         except Exception:  # noqa: BLE001 - a scheduler job must never die silently
             log.exception("Refresh failed")
 
@@ -84,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # valid image rather than a 404.
         if store.current_digest() is None:
             payload = to_device_bytes(
-                render_message("trmnl-screen-1", ["Kalender wird geladen …"]), store.image_ext
+                render_message("Küchentisch-Wetter", ["Wetter wird geladen …"]), store.image_ext
             )
             store.save_image(hashlib.sha1(payload).hexdigest()[:16], payload)
 
@@ -94,14 +96,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Logged in full because a deployment that misbehaves is almost always
         # a variable that did not arrive the way it was meant to.
         log.info(
-            "Started. data_dir=%s writable=%s url_prefix=%r caldav=%s ics=%s "
+            "Started. data_dir=%s writable=%s url_prefix=%r location=%.4f,%.4f day_switch=%02d:00 "
             "allowed_macs=%d lock_first_pairing=%s fetch_at=:%s refresh=%ds quiet=%02d-%02d tz=%s "
             "image=%s full_refresh_every=%d temp_profile=%s firmware_target=%s",
             settings.data_dir,
             os.access(settings.data_dir, os.W_OK),
             settings.url_prefix or "(none)",
-            settings.caldav_configured,
-            [name for name, _ in settings.ics_sources] or "(none)",
+            settings.latitude,
+            settings.longitude,
+            settings.day_switch_hour,
             len(settings.allowed_mac_set),
             settings.lock_after_first_pairing,
             settings.fetch_at_minutes,
@@ -352,7 +355,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not secrets.compare_digest(supplied_token, token):
             raise HTTPException(status_code=404, detail="Not found")
         await do_refresh()
-        return JSONResponse({"digest": state.digest, "events": state.event_count})
+        return JSONResponse({"digest": state.digest, "shown_days": state.shown_days})
 
     # --- operations -------------------------------------------------------
 
@@ -364,11 +367,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "ok": True,
                 "digest": state.digest,
                 "generated_at": state.generated_at.isoformat() if state.generated_at else None,
-                "events": state.event_count,
-                "stale_calendars": state.stale_calendars,
+                "shown_days": state.shown_days,
+                "forecast_fetched_at": (
+                    state.forecast_fetched_at.isoformat() if state.forecast_fetched_at else None
+                ),
                 "last_error": state.last_error,
-                "caldav_configured": settings.caldav_configured,
-                "ics_sources": [name for name, _ in settings.ics_sources],
+                "location": {"latitude": settings.latitude, "longitude": settings.longitude},
+                "day_switch_hour": settings.day_switch_hour,
                 "image_format": settings.image_format,
                 "full_refresh_every": settings.full_refresh_every,
                 "temperature_profile": settings.temperature_profile,
@@ -391,7 +396,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # The platform healthcheck has to reach a fixed path, so it cannot live
     # behind URL_PREFIX. It deliberately says nothing beyond "the process is
-    # up" — the detailed view at <prefix>/status exposes calendar and device
+    # up" — the detailed view at <prefix>/status exposes forecast and device
     # data and stays behind the secret.
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

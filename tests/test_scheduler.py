@@ -63,6 +63,45 @@ def test_night_refresh_rate_sleeps_until_morning():
     assert rate == 5 * 3600 + 50 * 60
 
 
+def test_the_device_is_woken_just_after_the_day_switch():
+    # 19:50 would normally sleep until 20:05; it is cut short to 20:01.
+    rate = refresh_rate_for(datetime(2026, 11, 26, 19, 50, tzinfo=TZ), settings())
+    assert rate == 11 * 60
+
+
+def test_after_the_switch_the_normal_interval_returns():
+    assert refresh_rate_for(datetime(2026, 11, 26, 20, 1, tzinfo=TZ), settings()) == 900
+
+
+def test_switch_hour_24_never_shortens_the_sleep():
+    rate = refresh_rate_for(datetime(2026, 11, 26, 22, 50, tzinfo=TZ), settings(day_switch_hour=24))
+    assert rate == 900
+
+
+def test_the_day_switch_has_its_own_refresh():
+    scheduler = build_scheduler(settings(fetch_at_minutes="15,45"), _noop)
+    fields = {f.name: str(f) for f in scheduler.get_job("day_switch_refresh").trigger.fields}
+    assert (fields["hour"], fields["minute"]) == ("20", "0")
+
+
+def test_no_switch_refresh_without_an_early_switch():
+    scheduler = build_scheduler(settings(day_switch_hour=24), _noop)
+    assert scheduler.get_job("day_switch_refresh") is None
+
+
+@pytest.mark.parametrize("hour", [0, 25, -1])
+def test_day_switch_hour_is_validated(hour):
+    with pytest.raises(ValidationError):
+        settings(day_switch_hour=hour)
+
+
+def test_location_is_validated():
+    with pytest.raises(ValidationError):
+        settings(latitude=91)
+    with pytest.raises(ValidationError):
+        settings(longitude=-181)
+
+
 def test_refresh_rate_never_returns_zero():
     rate = refresh_rate_for(datetime(2026, 8, 5, 4, 59, 59, tzinfo=TZ), settings())
     assert rate >= 60
@@ -97,9 +136,7 @@ def test_periodic_job_fires_on_the_configured_minutes():
     assert str(minutes) == "0,30"
 
 
-def test_morning_refresh_lands_on_a_half_hour():
-    # Otherwise the first screen of the day would carry a stamp that no other
-    # refresh in the day produces.
+def test_morning_refresh_runs_before_the_device_wakes():
     scheduler = build_scheduler(settings(), _noop)
     trigger = scheduler.get_job("morning_refresh").trigger
     fields = {f.name: str(f) for f in trigger.fields}

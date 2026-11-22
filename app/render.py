@@ -1,68 +1,74 @@
-"""Drawing the week onto an 800x480 1-bit image.
+"""Drawing the weather onto an 800x480 1-bit image.
 
 Everything is rendered directly with Pillow rather than through a headless
 browser. At this size a browser costs a large container and a slow render, and
 its anti-aliased text has to be thresholded down to 1 bit afterwards, which is
-exactly what makes small type look muddy on e-ink. Drawing unantialiased from
-the start keeps the glyphs crisp.
+exactly what makes type look muddy on e-ink. Drawing unantialiased from the
+start keeps the glyphs crisp.
+
+The layout follows the mockup: the day that matters large on the left, the day
+after it small on the right. Coordinates are baselines, as in the mockup's SVG.
 """
 
 from __future__ import annotations
 
-from collections import deque
-from datetime import date, datetime
+import io
+import math
+from datetime import date
+from functools import lru_cache
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .layout import WeekLayout
+from .weather import PARTS, DayForecast
 
 WIDTH = 800
 HEIGHT = 480
-
-HEADER_H = 16
-DAYHEAD_H = 18
-TIME_COL_W = 32
-ALL_DAY_ROW_H = 14
-ALL_DAY_PAD = 3
 
 BLACK = 0
 WHITE = 255
 
 FONT_DIR = Path(__file__).resolve().parent.parent / "fonts"
-REGULAR = FONT_DIR / "DejaVuSansCondensed.ttf"
-BOLD = FONT_DIR / "DejaVuSansCondensed-Bold.ttf"
+BOLD = FONT_DIR / "BarlowCondensed-Bold.ttf"
+SEMIBOLD = FONT_DIR / "BarlowCondensed-SemiBold.ttf"
+MEDIUM = FONT_DIR / "BarlowCondensed-Medium.ttf"
 
-WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 MONTHS = [
     "Januar", "Februar", "März", "April", "Mai", "Juni",
     "Juli", "August", "September", "Oktober", "November", "Dezember",
 ]
-MONTHS_SHORT = [
-    "Jan", "Feb", "Mär", "Apr", "Mai", "Jun",
-    "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
-]
+
+# Left column: the day shown large.
+MAIN_RIGHT = 512
+# Four parts of the day share the strip under the rule.
+PARTS_LEFT = 20
+PARTS_WIDTH = 492
+# Right column: the day after.
+DIVIDER_X = 534
+SIDE_X = 556
+SIDE_WIDTH = 222
 
 
-class Fonts:
-    def __init__(self) -> None:
-        self.title = ImageFont.truetype(str(BOLD), 12)
-        self.meta = ImageFont.truetype(str(REGULAR), 11)
-        self.dayhead = ImageFont.truetype(str(BOLD), 12)
-        self.hour = ImageFont.truetype(str(REGULAR), 10)
-        self.event = ImageFont.truetype(str(REGULAR), 11)
-        self.small = ImageFont.truetype(str(REGULAR), 9)
+@lru_cache(maxsize=64)
+def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(path), size)
 
 
-_fonts: Fonts | None = None
+def fitted(path: Path, size: int, text: str, max_width: float) -> ImageFont.FreeTypeFont:
+    """The largest font up to ``size`` in which ``text`` fits ``max_width``.
 
-
-def fonts() -> Fonts:
-    global _fonts
-    if _fonts is None:
-        _fonts = Fonts()
-    return _fonts
+    The layout is drawn for the common case. A long weekday in the narrow
+    column, or a two-digit frost, shrinks instead of running into its neighbour.
+    """
+    face = font(path, size)
+    width = face.getlength(text)
+    if width <= max_width:
+        return face
+    size = max(8, math.floor(size * max_width / width))
+    while size > 8 and font(path, size).getlength(text) > max_width:
+        size -= 1
+    return font(path, size)
 
 
 def _new_canvas() -> tuple[Image.Image, ImageDraw.ImageDraw]:
@@ -73,273 +79,244 @@ def _new_canvas() -> tuple[Image.Image, ImageDraw.ImageDraw]:
     return image, draw
 
 
-def column_x(index: int) -> int:
-    """Left edge of day column ``index`` (0..7, where 7 is the right border)."""
-    return TIME_COL_W + round(index * (WIDTH - TIME_COL_W) / 7)
+# --- wording -------------------------------------------------------------------
 
 
-def _text_width(font: ImageFont.FreeTypeFont, text: str) -> float:
-    return font.getlength(text)
+def deg(value: int) -> str:
+    """A temperature with a real minus sign, which is wider and easier to read
+    from across the room than a hyphen."""
+    return f"{'−' if value < 0 else ''}{abs(value)}°"
 
 
-def fit_text(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> str:
-    """Truncate with an ellipsis so it never spills out of its box."""
-    if _text_width(font, text) <= max_width:
-        return text
-    ellipsis = "…"
-    if _text_width(font, ellipsis) > max_width:
-        return ""
-    low, high = 0, len(text)
-    while low < high:
-        mid = (low + high + 1) // 2
-        if _text_width(font, text[:mid] + ellipsis) <= max_width:
-            low = mid
-        else:
-            high = mid - 1
-    return text[:low] + ellipsis if low else ellipsis
+def millimetres(value: float) -> str:
+    if value < 0.05:
+        return "0 mm"
+    if value < 0.95:
+        return f"{value:.1f} mm".replace(".", ",")
+    return f"{math.floor(value + 0.5)} mm"
 
 
-def _longest_prefix(word: str, font: ImageFont.FreeTypeFont, max_width: float) -> str:
-    low, high = 0, len(word)
-    while low < high:
-        mid = (low + high + 1) // 2
-        if _text_width(font, word[:mid]) <= max_width:
-            low = mid
-        else:
-            high = mid - 1
-    return word[:low]
+def rain_line(day: DayForecast) -> str:
+    amount = millimetres(day.precip_sum)
+    if day.precip_probability is None:
+        return f"Regen {amount}"
+    return f"Regen {day.precip_probability} % · {amount}"
 
 
-def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: float, max_lines: int) -> list[str]:
-    """Greedy wrap.
+def wind_line(day: DayForecast) -> str:
+    if day.gusts is not None and day.gusts > day.wind:
+        return f"Wind {day.wind}–{day.gusts} km/h"
+    return f"Wind {day.wind} km/h"
 
-    A word too long for the column is broken rather than ellipsised, and only
-    the final line gets an ellipsis, and only when text is actually left over.
-    Ellipsising mid-title would claim the title ends there while the next line
-    carries on, which reads as a different event entirely.
+
+def date_line(day: date) -> str:
+    return f"{day.day}. {MONTHS[day.month - 1]}"
+
+
+def weekday(day: date) -> str:
+    return WEEKDAYS[day.weekday()]
+
+
+# --- 1-bit weather icons ---------------------------------------------------------
+#
+# Each icon is drawn on a 100-unit square scaled to ``size`` pixels. Outlines
+# are made by filling a shape black and then the same shape, shrunk by the
+# stroke width, white: for a cloud built from overlapping circles that gives a
+# clean outline of the union without any path maths.
+
+STROKE = 6
+CLOUD_LOBES = ((30, 58, 16), (52, 44, 21), (72, 59, 15))
+
+
+class _Pen:
+    def __init__(self, draw: ImageDraw.ImageDraw, x: int, y: int, size: int) -> None:
+        self.draw = draw
+        self.x = x
+        self.y = y
+        self.k = size / 100
+        self.stroke = max(2, round(STROKE * self.k))
+
+    def p(self, ux: float, uy: float) -> tuple[int, int]:
+        return round(self.x + ux * self.k), round(self.y + uy * self.k)
+
+    def disc(self, cx: float, cy: float, r: float, fill: int) -> None:
+        x0, y0 = self.p(cx - r, cy - r)
+        x1, y1 = self.p(cx + r, cy + r)
+        self.draw.ellipse((x0, y0, x1, y1), fill=fill)
+
+    def rect(self, ux0: float, uy0: float, ux1: float, uy1: float, fill: int) -> None:
+        self.draw.rectangle((*self.p(ux0, uy0), *self.p(ux1, uy1)), fill=fill)
+
+    def line(self, ux0: float, uy0: float, ux1: float, uy1: float) -> None:
+        self.draw.line((*self.p(ux0, uy0), *self.p(ux1, uy1)), fill=BLACK, width=self.stroke)
+
+    def polygon(self, points: list[tuple[float, float]]) -> None:
+        self.draw.polygon([self.p(ux, uy) for ux, uy in points], fill=BLACK)
+
+
+def _cloud(pen: _Pen, dy: float = 0, solid: bool = False) -> None:
+    inset = STROKE
+    for cx, cy, r in CLOUD_LOBES:
+        pen.disc(cx, cy + dy, r, BLACK)
+    pen.rect(30, 58 + dy, 72, 74 + dy, BLACK)
+    if solid:
+        return
+    for cx, cy, r in CLOUD_LOBES:
+        pen.disc(cx, cy + dy, r - inset, WHITE)
+    pen.rect(30, 52 + dy, 72, 74 + dy - inset, WHITE)
+
+
+def _sun(pen: _Pen, cx: float, cy: float, r: float, ray_from: float, ray_to: float) -> None:
+    for i in range(8):
+        angle = i * math.pi / 4
+        pen.line(
+            cx + math.cos(angle) * ray_from, cy + math.sin(angle) * ray_from,
+            cx + math.cos(angle) * ray_to, cy + math.sin(angle) * ray_to,
+        )
+    pen.disc(cx, cy, r, BLACK)
+    pen.disc(cx, cy, r - STROKE, WHITE)
+
+
+def _moon(pen: _Pen, cx: float, cy: float, r: float) -> None:
+    pen.disc(cx, cy, r, BLACK)
+    pen.disc(cx + r * 0.5, cy - r * 0.36, r * 0.86, WHITE)
+
+
+def _drops(pen: _Pen, xs: tuple[int, ...]) -> None:
+    for i, x in enumerate(xs):
+        offset = (i % 2) * 4
+        pen.line(x, 70 + offset, x - 6, 86 + offset)
+
+
+def draw_icon(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, size: int) -> None:
+    pen = _Pen(draw, x, y, size)
+    if kind == "clear":
+        _sun(pen, 50, 50, 17, 24, 36)
+    elif kind == "moon":
+        _moon(pen, 46, 52, 28)
+    elif kind == "partly":
+        _sun(pen, 34, 34, 13, 19, 28)
+        _cloud(pen, dy=6)
+    elif kind == "partly_night":
+        _moon(pen, 32, 34, 18)
+        _cloud(pen, dy=6)
+    elif kind == "fog":
+        for row, (x0, x1) in enumerate(((18, 82), (26, 74), (18, 82))):
+            pen.line(x0, 38 + row * 16, x1, 38 + row * 16)
+    elif kind == "rain":
+        _cloud(pen, dy=-12)
+        _drops(pen, (36, 52, 68))
+    elif kind == "heavyrain":
+        _cloud(pen, dy=-12, solid=True)
+        _drops(pen, (34, 46, 58, 70))
+    elif kind == "snow":
+        _cloud(pen, dy=-12)
+        for fx, fy in ((36, 76), (52, 88), (68, 76)):
+            pen.disc(fx, fy, 5, BLACK)
+    elif kind == "thunder":
+        _cloud(pen, dy=-12)
+        pen.polygon([(54, 60), (40, 82), (50, 82), (44, 99), (64, 74), (53, 74), (60, 60)])
+    else:  # "cloud" and anything unknown
+        _cloud(pen, dy=-2)
+
+
+# --- the screen ------------------------------------------------------------------
+
+
+def _text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, face, fill: int = BLACK,
+          anchor: str = "ls") -> None:
+    draw.text(xy, text, font=face, fill=fill, anchor=anchor)
+
+
+def render_weather(main: DayForecast, side: DayForecast, stale_note: str | None = None) -> Image.Image:
+    """The screen: ``main`` large on the left, ``side`` compact on the right.
+
+    ``stale_note`` is shown only when the forecast could not be refreshed for a
+    while. There is deliberately no clock time otherwise: without one the image
+    changes only when the forecast does, so the panel is redrawn far less often.
     """
-    if max_lines <= 0:
-        return []
-    words = deque(text.split())
-    if not words:
-        return []
-
-    lines: list[str] = []
-    while words and len(lines) < max_lines:
-        line = ""
-        while words:
-            candidate = f"{line} {words[0]}".strip()
-            if _text_width(font, candidate) <= max_width:
-                line = candidate
-                words.popleft()
-            else:
-                break
-
-        if not line:
-            # The next word does not fit on an empty line: break it.
-            word = words.popleft()
-            prefix = _longest_prefix(word, font, max_width)
-            if not prefix:
-                break
-            line = prefix
-            remainder = word[len(prefix):]
-            if remainder:
-                words.appendleft(remainder)
-
-        lines.append(line)
-
-    if words and lines:
-        lines[-1] = fit_text(f"{lines[-1]} {' '.join(words)}", font, max_width)
-    return lines
-
-
-def _dotted_line(draw: ImageDraw.ImageDraw, x0: int, y: int, x1: int, step: int = 3) -> None:
-    for x in range(x0, x1, step):
-        draw.point((x, y), fill=BLACK)
-
-
-def _header_range(monday: date, sunday: date) -> str:
-    if monday.month == sunday.month:
-        return f"{monday.day}.–{sunday.day}. {MONTHS[monday.month - 1]} {sunday.year}"
-    if monday.year == sunday.year:
-        return (
-            f"{monday.day}. {MONTHS_SHORT[monday.month - 1]} – "
-            f"{sunday.day}. {MONTHS_SHORT[sunday.month - 1]} {sunday.year}"
-        )
-    return (
-        f"{monday.day}. {MONTHS_SHORT[monday.month - 1]} {monday.year} – "
-        f"{sunday.day}. {MONTHS_SHORT[sunday.month - 1]} {sunday.year}"
-    )
-
-
-def render_week(layout: WeekLayout, now: datetime, tz: ZoneInfo) -> Image.Image:
     image, draw = _new_canvas()
-    f = fonts()
-    window = layout.window
-    today = now.astimezone(tz).date()
 
-    # --- header -----------------------------------------------------------
-    week_no = window.monday.isocalendar().week
-    title = f"KW {week_no} · {_header_range(window.monday, window.sunday)}"
-    draw.text((2, 1), title, font=f.title, fill=BLACK)
+    # --- the day that matters ------------------------------------------------
+    name = weekday(main.day)
+    _text(draw, (22, 104), name, fitted(BOLD, 108, name, MAIN_RIGHT - 22 - 4))
+    _text(draw, (24, 146), date_line(main.day), font(MEDIUM, 32))
 
-    stamp = layout.generated_at.astimezone(tz).strftime("%H:%M") if layout.generated_at else ""
-    if layout.stale_calendars:
-        stamp = f"{stamp}  ! {', '.join(layout.stale_calendars)}"
-        stamp = fit_text(stamp, f.meta, WIDTH / 2 - 6)
-    if stamp:
-        draw.text((WIDTH - 2 - _text_width(f.meta, stamp), 2), stamp, font=f.meta, fill=BLACK)
+    draw_icon(draw, main.icon, 14, 170, 110)
+    big = deg(main.temp_max)
+    _text(draw, (300, 278), big, fitted(BOLD, 128, big, 300 - 132), anchor="rs")
 
-    draw.line((0, HEADER_H, WIDTH, HEADER_H), fill=BLACK)
+    facts_x = 320
+    facts_width = MAIN_RIGHT - facts_x
+    feel = f"Gefühlt {deg(main.feel_max)}"
+    _text(draw, (facts_x, 208), feel, fitted(SEMIBOLD, 30, feel, facts_width))
+    rain = rain_line(main)
+    _text(draw, (facts_x, 244), rain, fitted(MEDIUM, 30, rain, facts_width))
+    wind = wind_line(main)
+    _text(draw, (facts_x, 280), wind, fitted(MEDIUM, 30, wind, facts_width))
 
-    # --- day headers ------------------------------------------------------
-    dayhead_top = HEADER_H + 1
-    for index, day in enumerate(window.days):
-        x0, x1 = column_x(index), column_x(index + 1)
-        label = f"{WEEKDAYS[index]} {day.day:02d}."
-        if day == today:
-            draw.rectangle((x0, dayhead_top, x1 - 1, dayhead_top + DAYHEAD_H - 2), fill=BLACK)
-            fill = WHITE
-        else:
-            fill = BLACK
-        text_x = x0 + (x1 - x0 - _text_width(f.dayhead, label)) / 2
-        draw.text((text_x, dayhead_top + 2), label, font=f.dayhead, fill=fill)
+    if main.text:
+        _text(draw, (24, 326), main.text, fitted(MEDIUM, 30, main.text, MAIN_RIGHT - 24))
 
-    band_top = HEADER_H + DAYHEAD_H
-    draw.line((0, band_top, WIDTH, band_top), fill=BLACK)
-
-    # --- all-day band -----------------------------------------------------
-    all_day_h = layout.all_day_rows * ALL_DAY_ROW_H + ALL_DAY_PAD if layout.all_day_rows else 0
-    for bar in layout.all_day_bars:
-        x0 = column_x(bar.first_day) + 1
-        x1 = column_x(bar.last_day + 1) - 1
-        y0 = band_top + 1 + bar.row * ALL_DAY_ROW_H
-        y1 = y0 + ALL_DAY_ROW_H - 2
-        draw.rectangle((x0, y0, x1, y1), outline=BLACK, fill=WHITE)
-        label = fit_text(bar.event.summary, f.event, x1 - x0 - 6)
-        draw.text((x0 + 3, y0 + 1), label, font=f.event, fill=BLACK)
-
-    for day_index, count in layout.all_day_overflow.items():
-        x1 = column_x(day_index + 1)
-        marker = f"+{count}"
-        draw.text(
-            (x1 - 2 - _text_width(f.small, marker), band_top + 1),
-            marker,
-            font=f.small,
-            fill=BLACK,
-        )
-
-    grid_top = band_top + all_day_h
-    if all_day_h:
-        draw.line((0, grid_top, WIDTH, grid_top), fill=BLACK)
-
-    # --- time grid --------------------------------------------------------
-    grid_h = HEIGHT - grid_top
-    span = layout.span_hours or 1.0
-    px_per_hour = grid_h / span
-
-    def y_of(hour: float) -> float:
-        return grid_top + (hour - layout.start_hour) * px_per_hour
-
-    hour = int(layout.start_hour)
-    while hour <= layout.end_hour:
-        if hour >= layout.start_hour:
-            y = int(y_of(hour))
-            if grid_top < y < HEIGHT:
-                draw.line((TIME_COL_W, y, WIDTH, y), fill=BLACK)
-            if y + 10 < HEIGHT:
-                draw.text((2, y + 1), f"{hour:02d}", font=f.hour, fill=BLACK)
-        half = hour + 0.5
-        if layout.start_hour <= half <= layout.end_hour:
-            y_half = int(y_of(half))
-            if grid_top < y_half < HEIGHT:
-                _dotted_line(draw, TIME_COL_W, y_half, WIDTH)
-        hour += 1
-
-    for index in range(8):
-        x = column_x(index)
-        draw.line((x, grid_top, x, HEIGHT), fill=BLACK)
-
-    # --- current time -----------------------------------------------------
-    today_index = window.index_of(today)
-    if today_index is not None:
-        local = now.astimezone(tz)
-        now_hour = local.hour + local.minute / 60
-        if layout.start_hour <= now_hour <= layout.end_hour:
-            y = int(y_of(now_hour))
-            x0, x1 = column_x(today_index), column_x(today_index + 1)
-            draw.line((x0, y, x1, y), fill=BLACK, width=2)
-            draw.polygon([(x0, y - 3), (x0 + 5, y), (x0, y + 3)], fill=BLACK)
-
-    # --- event blocks -----------------------------------------------------
-    for block in layout.blocks:
-        col_left = column_x(block.day_index)
-        col_right = column_x(block.day_index + 1)
-        col_width = col_right - col_left
-        slot_width = col_width / block.columns
-
-        x0 = int(col_left + block.column * slot_width) + 1
-        x1 = int(col_left + (block.column + 1) * slot_width) - 1
-        y0 = int(y_of(block.start_hour)) + 1
-        y1 = int(y_of(block.end_hour)) - 1
-        if y1 <= y0:
-            y1 = y0 + 1
-        if x1 <= x0:
+    # --- four parts of the day ------------------------------------------------
+    draw.rectangle((PARTS_LEFT, 346, PARTS_LEFT + PARTS_WIDTH - 1, 347), fill=BLACK)
+    cell = PARTS_WIDTH / len(PARTS)
+    for i, (part, forecast) in enumerate(zip(PARTS, main.parts, strict=True)):
+        left = PARTS_LEFT + i * cell
+        right = round(left + cell)
+        if i:
+            draw.rectangle((round(left), 360, round(left), 469), fill=BLACK)
+        lx = round(left + (10 if i else 2))
+        _text(draw, (lx, 376), part.label, font(SEMIBOLD, 18))
+        if forecast is None:
+            _text(draw, (lx + 52, 428), "–", font(BOLD, 42))
             continue
+        draw_icon(draw, forecast.icon, lx - 2, 386, 50)
+        temp = deg(forecast.temp)
+        _text(draw, (lx + 52, 428), temp, fitted(BOLD, 42, temp, right - 4 - (lx + 52)))
+        _text(draw, (lx + 54, 460), deg(forecast.feel), font(MEDIUM, 24))
 
-        draw.rectangle((x0, y0, x1, y1), outline=BLACK, fill=WHITE)
+    draw.rectangle((DIVIDER_X, 24, DIVIDER_X + 1, 455), fill=BLACK)
 
-        inner_w = x1 - x0 - 5
-        inner_h = y1 - y0 - 2
-        line_h = 11
-        max_lines = max(1, int(inner_h // line_h))
-        if inner_w < 8:
-            continue
+    # --- the day after --------------------------------------------------------
+    rx = SIDE_X
+    name = weekday(side.day)
+    _text(draw, (rx, 74), name, fitted(BOLD, 62, name, SIDE_WIDTH))
+    _text(draw, (rx + 1, 106), date_line(side.day), font(MEDIUM, 24))
+    draw_icon(draw, side.icon, rx - 6, 120, 100)
+    high = deg(side.temp_max)
+    _text(draw, (rx + 112, 186), high, fitted(BOLD, 66, high, SIDE_WIDTH - 112))
+    _text(draw, (rx + 114, 218), f"min {deg(side.temp_min)}", font(SEMIBOLD, 26))
 
-        lines = wrap_text(block.event.summary, f.event, inner_w, max_lines)
-        text_y = y0 + 1
-        for line in lines:
-            if text_y + line_h > y1 + 1:
-                break
-            draw.text((x0 + 3, text_y), line, font=f.event, fill=BLACK)
-            text_y += line_h
+    # One size, one line pitch: 24 px type on a 32 px step.
+    for y, line in ((270, side.text), (302, rain_line(side)), (334, wind_line(side))):
+        if line:
+            _text(draw, (rx, y), line, fitted(MEDIUM, 24, line, SIDE_WIDTH))
 
-    # --- events outside the visible window ---------------------------------
-    for day_index, count in layout.overflow_early.items():
-        x1 = column_x(day_index + 1)
-        marker = f"↑{count}"
-        draw.text((x1 - 2 - _text_width(f.small, marker), grid_top + 1), marker, font=f.small, fill=BLACK)
-
-    for day_index, count in layout.overflow_late.items():
-        x1 = column_x(day_index + 1)
-        marker = f"↓{count}"
-        draw.text(
-            (x1 - 2 - _text_width(f.small, marker), HEIGHT - 11),
-            marker,
-            font=f.small,
-            fill=BLACK,
-        )
+    if stale_note:
+        draw.rectangle((rx - 6, 430, rx + SIDE_WIDTH + 5, 461), fill=BLACK)
+        _text(draw, (rx + 4, 453), stale_note, fitted(SEMIBOLD, 20, stale_note, SIDE_WIDTH - 4), fill=WHITE)
 
     return image
 
 
 def render_message(title: str, lines: list[str]) -> Image.Image:
-    """A plain screen for setup and error states."""
+    """A plain screen for start-up and error states."""
     image, draw = _new_canvas()
-    f = fonts()
-    big = ImageFont.truetype(str(BOLD), 28)
-    draw.text(((WIDTH - _text_width(big, title)) / 2, 150), title, font=big, fill=BLACK)
-    y = 210
+    title_face = fitted(BOLD, 56, title, WIDTH - 80)
+    _text(draw, (WIDTH // 2, 200), title, title_face, anchor="ms")
+    y = 260
     for line in lines:
-        draw.text(((WIDTH - _text_width(f.event, line)) / 2, y), line, font=f.event, fill=BLACK)
-        y += 18
+        _text(draw, (WIDTH // 2, y), line, fitted(MEDIUM, 28, line, WIDTH - 80), anchor="ms")
+        y += 38
     return image
+
+
+# --- what the device downloads ---------------------------------------------------
 
 
 def to_bmp_bytes(image: Image.Image) -> bytes:
     """1-bit BMP3. Kept as a fallback; see to_device_bytes for why not to use it."""
-    import io
-
     mono = image.convert("1", dither=Image.Dither.NONE)
     buffer = io.BytesIO()
     mono.save(buffer, format="BMP")
@@ -354,8 +331,6 @@ def to_png_bytes(image: Image.Image) -> bytes:
     convention (a set bit is white) is the same one the BMP raster uses, so
     the two formats put identical pixels on the glass.
     """
-    import io
-
     mono = image.convert("1", dither=Image.Dither.NONE)
     buffer = io.BytesIO()
     mono.save(buffer, format="PNG")
@@ -365,7 +340,7 @@ def to_png_bytes(image: Image.Image) -> bytes:
 def to_device_bytes(image: Image.Image, image_format: str) -> bytes:
     """The bytes the device downloads.
 
-    PNG, and not for the size — a typical week is about 2 KB against the BMP's
+    PNG, and not for the size — a typical screen is a few KB against the BMP's
     fixed 48 062 bytes, welcome as that is on a battery-powered radio.
 
     The firmware's BMP branch ends with ``iUpdateCount = 1`` on every single

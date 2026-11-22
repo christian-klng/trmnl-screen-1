@@ -116,3 +116,28 @@ def test_the_current_screen_is_never_cleaned_up(tmp_path):
     for digest in ("aaa", "bbb", "ccc", "ddd", "eee"):
         store.save_image(digest, b"screen")
     assert store.image_path(store.current_digest()).exists()
+
+
+def test_the_old_calendar_cache_is_dropped(tmp_path):
+    """The calendar screen left a table that could hold megabytes."""
+    old_database(tmp_path)
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("CREATE TABLE calendar_cache (name TEXT PRIMARY KEY, documents TEXT, fetched_at TEXT)")
+    conn.commit()
+    conn.close()
+
+    store = Store(tmp_path)
+    with store._connect() as conn:
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "calendar_cache" not in tables
+    assert store.get_device(MAC)["api_key"] == "secret-key"
+
+
+def test_the_forecast_round_trips(tmp_path):
+    store = Store(tmp_path)
+    assert store.load_forecast() is None
+    when = datetime(2026, 11, 26, 14, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+    store.save_forecast({"daily": {"time": ["2026-11-26"]}}, when)
+    raw, fetched_at = store.load_forecast()
+    assert raw == {"daily": {"time": ["2026-11-26"]}}
+    assert fetched_at == when

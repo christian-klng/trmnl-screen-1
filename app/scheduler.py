@@ -29,12 +29,25 @@ def seconds_until(local: datetime, hour: int) -> int:
     return max(60, int((target - local).total_seconds()))
 
 
+# How long after the day switch the device is woken. The server renders the
+# new day on the hour; this leaves time for that fetch to finish first.
+SWITCH_GRACE_SECONDS = 60
+
+
 def refresh_rate_for(now: datetime, settings: Settings) -> int:
-    """How long the device should sleep before polling again."""
+    """How long the device should sleep before polling again.
+
+    Normally the configured interval. Close to the day switch it is shortened
+    so the device wakes just after it: with a 15-minute interval the new day
+    would otherwise appear up to 15 minutes late.
+    """
     local = now.astimezone(settings.tz)
     if in_quiet_hours(local, settings.quiet_start_hour, settings.quiet_end_hour):
         return seconds_until(local, settings.quiet_end_hour)
-    return settings.display_refresh_seconds
+    rate = settings.display_refresh_seconds
+    if settings.day_switch_hour < 24:
+        rate = min(rate, seconds_until(local, settings.day_switch_hour) + SWITCH_GRACE_SECONDS)
+    return rate
 
 
 def full_refresh_due(
@@ -70,11 +83,8 @@ def full_refresh_due(
 
 
 def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
-    """Refresh on fixed minutes of the hour, paused overnight.
-
-    Fixed minutes rather than an interval because the rendered image carries an
-    HH:MM stamp: on an interval it drifts across the hour, on fixed minutes it
-    always reads the same tidy values.
+    """Refresh on fixed minutes of the hour, paused overnight, and always at
+    the day switch.
 
     The gap between refreshes is long, and nothing else keeps the process busy
     in between. It has to run on a host that does not put idle services to
@@ -98,9 +108,20 @@ def build_scheduler(settings: Settings, refresh_callable) -> AsyncIOScheduler:
         coalesce=True,
     )
 
+    # The screen moves on to the next day on the hour. Usually a periodic
+    # refresh lands there anyway, but not with every FETCH_AT_MINUTES, and not
+    # if the switch falls into the quiet hours.
+    if settings.day_switch_hour < 24:
+        scheduler.add_job(
+            refresh_callable,
+            CronTrigger(hour=settings.day_switch_hour, minute=0, timezone=settings.tz),
+            id="day_switch_refresh",
+            max_instances=1,
+            coalesce=True,
+        )
+
     # One fetch shortly before the device wakes, so the first screen of the day
-    # is current rather than eight hours old. On the half hour like every other
-    # refresh, so the stamp on that first screen reads like all the others.
+    # is current rather than eight hours old.
     wake_prep_hour = (settings.quiet_end_hour - 1) % 24
     scheduler.add_job(
         refresh_callable,

@@ -21,18 +21,18 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    # --- CalDAV (Nextcloud) -------------------------------------------------
-    caldav_url: str = ""
-    caldav_username: str = ""
-    caldav_password: str = ""
-    # Empty means "every calendar the account can see".
-    caldav_calendars: str = ""
+    # --- Weather -------------------------------------------------------------
+    # Where the forecast is for. The default is Treptower Park in Berlin, where
+    # this display stands on a kitchen table.
+    latitude: float = 52.4886
+    longitude: float = 13.4697
+    # Open-Meteo's forecast endpoint. Free, no key; for Germany its default
+    # model blend is DWD's ICON. Overridable for tests or a self-hosted copy.
+    weather_url: str = "https://api.open-meteo.com/v1/forecast"
 
-    # --- Direct ICS/webcal URLs ---------------------------------------------
-    # Comma separated, either "Name=https://…" or a bare URL. Fetched directly
-    # on our own schedule, which bypasses a slow Nextcloud subscription job for
-    # calendars that live somewhere else (a Google secret iCal address, say).
-    ics_urls: str = ""
+    # From this hour on the screen shows the next day large. 24 means it never
+    # switches early and simply follows the date.
+    day_switch_hour: int = 20
 
     # --- Display / device ---------------------------------------------------
     # Seconds the device sleeps between polls during the day.
@@ -68,23 +68,13 @@ class Settings(BaseSettings):
     firmware_retry_hours: int = 6
 
     # --- Fetching -----------------------------------------------------------
-    # Minutes of the hour at which calendars are refreshed, comma separated.
-    # Fixed minutes rather than an interval because the rendered image carries
-    # an HH:MM stamp: on an interval that stamp drifts, on fixed minutes it
-    # always reads a tidy value and the screen updates predictably.
+    # Minutes of the hour at which the forecast is refreshed, comma separated.
+    # Open-Meteo recomputes its forecast about once an hour, so twice an hour
+    # picks up every new run without hammering a free service.
     #
     # The server has to stay up between refreshes: a host that puts idle
     # services to sleep would answer the device's poll with a cold start.
     fetch_at_minutes: str = "0,30"
-
-    # --- Week window --------------------------------------------------------
-    # 6 == Sunday. From this weekday and hour onward the next week is shown.
-    week_switch_weekday: int = 6
-    week_switch_hour: int = 12
-
-    # --- Grid ---------------------------------------------------------------
-    grid_min_hours: int = 8
-    grid_max_hours: int = 15
 
     # --- Runtime ------------------------------------------------------------
     timezone: str = "Europe/Berlin"
@@ -112,10 +102,27 @@ class Settings(BaseSettings):
     # Only usable by clients that can send one; the TRMNL firmware cannot.
     pairing_secret: str = ""
 
-    @field_validator("caldav_url")
+    @field_validator("latitude")
     @classmethod
-    def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+    def _validate_latitude(cls, v: float) -> float:
+        if not -90 <= v <= 90:
+            raise ValueError(f"LATITUDE must lie between -90 and 90, not {v}")
+        return v
+
+    @field_validator("longitude")
+    @classmethod
+    def _validate_longitude(cls, v: float) -> float:
+        if not -180 <= v <= 180:
+            raise ValueError(f"LONGITUDE must lie between -180 and 180, not {v}")
+        return v
+
+    @field_validator("day_switch_hour")
+    @classmethod
+    def _validate_day_switch_hour(cls, v: int) -> int:
+        # 0 would show tomorrow around the clock, which is never what is meant.
+        if not 1 <= v <= 24:
+            raise ValueError(f"DAY_SWITCH_HOUR must lie between 1 and 24, not {v}")
+        return v
 
     @field_validator("fetch_at_minutes")
     @classmethod
@@ -211,33 +218,6 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
-
-    @property
-    def calendar_names(self) -> list[str]:
-        return [c.strip() for c in self.caldav_calendars.split(",") if c.strip()]
-
-    @property
-    def caldav_configured(self) -> bool:
-        return bool(self.caldav_url and self.caldav_username and self.caldav_password)
-
-    @property
-    def ics_sources(self) -> list[tuple[str, str]]:
-        """(display name, url) pairs parsed from ICS_URLS."""
-        sources: list[tuple[str, str]] = []
-        for index, entry in enumerate(self.ics_urls.split(",")):
-            entry = entry.strip()
-            if not entry:
-                continue
-            name, separator, url = entry.partition("=")
-            if separator and not name.strip().lower().startswith(("http", "webcal")):
-                sources.append((name.strip(), url.strip()))
-            else:
-                sources.append((f"ICS {index + 1}", entry))
-        return sources
-
-    @property
-    def any_source_configured(self) -> bool:
-        return self.caldav_configured or bool(self.ics_sources)
 
     @property
     def allowed_mac_set(self) -> set[str]:
